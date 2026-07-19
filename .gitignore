@@ -13,3 +13,4 @@ parameterized_ai/coevolution_stats.json
 parameterized_ai/*.log
 parameterized_ai/battles_*/
 AGENT.MD
+parsing/

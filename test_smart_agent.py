@@ -7,7 +7,9 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "parameterized_ai"))
 
-from coevolution import OpponentModel, PhaseShiftAI, SmartNeuralAgent, random_smart_genome
+from coevolution import (OpponentModel, PhaseShiftAI, SmartNeuralAgent,
+                          compare_smart_genomes, random_smart_genome,
+                          validate_smart_genome)
 from parameterized_ai_v2 import Character, CharType, Player, TurnLog
 
 
@@ -73,6 +75,34 @@ class TestOpponentModel(unittest.TestCase):
         late = opponent.choose_actions(player, other, 5, later_logs, 2)
         self.assertNotEqual(
             [a.action_type for a in early], [a.action_type for a in late])
+
+
+class TestFixedValidation(unittest.TestCase):
+    def test_validation_is_deterministic_and_preserves_rng(self):
+        genome = random_smart_genome(seed=11)
+        np.random.seed(1234)
+        numpy_before = np.random.get_state()
+        import random
+        python_before = random.getstate()
+
+        first = validate_smart_genome(genome, games=1)
+        second = validate_smart_genome(genome, games=1)
+
+        self.assertEqual(first, second)
+        self.assertEqual(python_before, random.getstate())
+        self.assertEqual(numpy_before[0], np.random.get_state()[0])
+        np.testing.assert_array_equal(numpy_before[1], np.random.get_state()[1])
+        self.assertEqual(numpy_before[2:], np.random.get_state()[2:])
+
+    def test_common_seed_genome_comparison_is_reproducible(self):
+        first = compare_smart_genomes(
+            random_smart_genome(seed=1), random_smart_genome(seed=2), games=2)
+        second = compare_smart_genomes(
+            random_smart_genome(seed=1), random_smart_genome(seed=2), games=2)
+        self.assertEqual(first, second)
+        self.assertEqual(first["games"], 2)
+        self.assertGreaterEqual(first["a_winrate"], 0.0)
+        self.assertLessEqual(first["a_winrate"], 1.0)
 
 
 class TestTacticalPlanner(unittest.TestCase):

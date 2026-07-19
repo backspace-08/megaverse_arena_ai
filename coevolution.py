@@ -167,6 +167,8 @@ SMART_PRODUCTION_CONFIG = {
     "hof_ratio": 0.25,
     "hof_max": 200,
     "reference_games": 8,
+    "validation_games": 12,
+    "champion_games": 8,
     "snapshot_interval": 10,
 }
 
@@ -190,6 +192,100 @@ def smart_genome_size():
 def random_smart_genome(seed=None):
     rng = np.random.RandomState(seed) if seed is not None else np.random.RandomState()
     return rng.randn(SMART_GENOME_SIZE).astype(np.float32) * 0.5
+
+
+def _smart_validation_opponents():
+    """Build fresh fixed-reference opponents for one validation pass."""
+    opponents = [(name, lambda profile=profile: WeightedRandomAIv2(profile))
+                 for name, profile in ANCHOR_PROFILES]
+    opponents.extend([
+        ("CounterAI", lambda: CounterAI("Counter")),
+        ("AdaptiveAI", AdaptiveAI),
+        ("PhaseShift", PhaseShiftAI),
+    ])
+    return opponents
+
+
+def _seeded_smart_game(agent_a, agent_b, seed, max_turns=50):
+    """Play one deterministic game and return the winner for agent_a.
+
+    Both Python and NumPy RNGs are seeded because Smart and reference agents
+    use both sources of randomness. The caller owns agent reset semantics.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    team_a, team_b = random_team(), random_team()
+    if random.random() < 0.5:
+        engine = BattleEngineV2(agent_a, agent_b, team_a, team_b)
+        winner = engine.run(max_turns)["winner"]
+        return winner == 1
+    engine = BattleEngineV2(agent_b, agent_a, team_b, team_a)
+    winner = engine.run(max_turns)["winner"]
+    return winner == 2
+
+
+def _with_rng_state(func):
+    """Run deterministic validation without perturbing training RNG streams."""
+    py_state = random.getstate()
+    np_state = np.random.get_state()
+    try:
+        return func()
+    finally:
+        random.setstate(py_state)
+        np.random.set_state(np_state)
+
+
+def validate_smart_genome(genome, games=12, seed_offset=0):
+    """Evaluate a Smart genome on a fixed, independent reference suite.
+
+    This score is diagnostic only. It is deliberately not used for selection
+    or breeding, so the suite can reveal moving-target self-play effects.
+    """
+    games = max(1, int(games))
+
+    def evaluate():
+        rates = {}
+        for matchup_index, (name, opponent_factory) in enumerate(_smart_validation_opponents()):
+            agent = SmartNeuralAgent(np.asarray(genome, dtype=np.float32).copy())
+            opponent = opponent_factory()
+            wins = 0
+            for game_index in range(games):
+                agent.reset_state()
+                if hasattr(opponent, "reset_state"):
+                    opponent.reset_state()
+                seed = seed_offset + matchup_index * 10000 + game_index
+                wins += int(_seeded_smart_game(agent, opponent, seed))
+            rates[name] = wins / games
+        values = sorted(rates.values())
+        raw = sum(values) / max(1, len(values))
+        robust = sum(values[:3]) / max(1, min(3, len(values)))
+        return {
+            "games": games,
+            "raw_rate": raw,
+            "robust_rate": robust,
+            "score": 0.60 * raw + 0.40 * robust,
+            "matchups": rates,
+        }
+
+    return _with_rng_state(evaluate)
+
+
+def compare_smart_genomes(genome_a, genome_b, games=8, seed_offset=100000):
+    """Compare two Smart genomes on common deterministic games."""
+    games = max(1, int(games))
+
+    def evaluate():
+        agent_a = SmartNeuralAgent(np.asarray(genome_a, dtype=np.float32).copy())
+        agent_b = SmartNeuralAgent(np.asarray(genome_b, dtype=np.float32).copy())
+        wins = 0
+        for game_index in range(games):
+            agent_a.reset_state()
+            agent_b.reset_state()
+            wins += int(_seeded_smart_game(agent_a, agent_b,
+                                            seed_offset + game_index))
+        return {"games": games, "a_winrate": wins / games}
+
+    return _with_rng_state(evaluate)
 
 
 class OpponentModel:
@@ -2052,6 +2148,7 @@ def run_smart_coevolution(pop_size=240, generations=120, games_per_eval=30,
                            n_jobs=8, verbose=True,
                            hof_add=12, hof_ratio=0.25, hof_max=200,
                            reference_games=8,
+                           validation_games=12, champion_games=8,
                            snapshot_interval=10):
     """Co-evolution with SmartNeuralAgent (12-param genome + opponent model).
     
@@ -2088,6 +2185,7 @@ def run_smart_coevolution(pop_size=240, generations=120, games_per_eval=30,
     meta_history = []
     gen_stats = []
     battle_records = []
+    champion_archive = []
 
     t0 = time.perf_counter()
 
@@ -2194,6 +2292,23 @@ def run_smart_coevolution(pop_size=240, generations=120, games_per_eval=30,
                 gen_stats[-1]["pattern_aa"] = totals["aa"]/n
 
                 best_genome = indexed[0][2]
+                validation = validate_smart_genome(
+                    best_genome, games=validation_games, seed_offset=0)
+                champion_row = {
+                    "generation": gen + 1,
+                    "validation": validation,
+                    "versus_champions": {},
+                }
+                for previous in champion_archive:
+                    champion_row["versus_champions"][str(previous["generation"])] = \
+                        compare_smart_genomes(
+                            best_genome, previous["genome"],
+                            games=champion_games, seed_offset=100000)
+                champion_archive.append({
+                    "generation": gen + 1,
+                    "genome": best_genome.copy(),
+                })
+                gen_stats[-1]["fixed_validation"] = champion_row
                 battle_log = _smart_record_battle(best_genome, gen+1, run_timestamp, battle_log_dir)
                 battle_records.append(battle_log)
 
@@ -2314,7 +2429,9 @@ if __name__ == "__main__":
 
     result = {"best_fitness": best_fitness, "generations": len(hist),
               "population_size": len(pop),
-              "fitness_history": [(float(b), float(a)) for b, a in hist]}
+              "fitness_history": [(float(b), float(a)) for b, a in hist],
+              "fixed_validation": [g.get("fixed_validation") for g in gen_stats
+                                   if g.get("fixed_validation")]}
     _write_json_atomic(os.path.join(ai_dir, "coevolution_result.json"), result, indent=2)
 
     print(f"Saved version {timestamp} (fitness={best_fitness:.1%})")
