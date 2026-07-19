@@ -227,6 +227,24 @@ def get_type_multiplier(atk_type: CharType, def_type: CharType) -> float:
     return _TYPE_MULT_TABLE.get((atk_type, def_type), 1.0)
 
 
+def round_damage(damage: float) -> int:
+    """Round resolved damage to the nearest hundred as the game UI does."""
+    return round(damage / 100) * 100
+
+
+def calculate_damage(attacker: Character, defender: Character,
+                     attack_count: int, blocked_count: int = 0) -> int:
+    """Calculate one exchange using the attacker's ATK only.
+
+    The defender's ATK never participates in incoming damage. Shields reduce
+    the number of attacks first; the complete raw exchange is then rounded.
+    """
+    unblocked = max(0, attack_count - blocked_count)
+    raw = attacker.atk * unblocked * get_type_multiplier(
+        attacker.char_type, defender.char_type)
+    return round_damage(raw)
+
+
 # ========================
 # AI v2
 # ========================
@@ -778,17 +796,20 @@ class BattleEngineV2:
         opp_shields = opponent.shields
         unblocked = max(0, attack_actions - opp_shields)
         blocked = min(attack_actions, opp_shields)
-        opponent.shields -= blocked
+        # Shields protect only the opponent's immediately following turn.
+        # They are fully consumed after that exchange, including when no
+        # attacks arrive.
+        opponent.shields = 0
         self.stats["attacks_blocked"] += blocked
 
         total_damage = 0
         overkill_actions = 0
         atk_char = player.active_character
 
-        # Compute dmg_per_hit BEFORE any damage (opponent still unchanged)
+        # Damage uses the attacker's ATK; defender ATK is irrelevant here.
         defender_type = opponent.active_character.char_type
         mult = get_type_multiplier(atk_char.char_type, defender_type)
-        dmg_per_hit = int(atk_char.atk * mult)
+        dmg_per_hit = round_damage(atk_char.atk * mult)
 
         # Save opponent HP before attacks for overkill calculation
         opp_hp_before = opponent.active_character.hp
@@ -801,7 +822,8 @@ class BattleEngineV2:
         if unblocked > 0 and opponent.active_character.is_alive():
             # Vectorized attack: compute total damage in one operation
             hp = opponent.active_character.hp
-            total_damage = min(hp, unblocked * dmg_per_hit)
+            total_damage = min(hp, calculate_damage(
+                atk_char, opponent.active_character, attack_actions, blocked))
             opponent.active_character.hp -= total_damage
             self.stats["damage_dealt"] += total_damage
             self.stats["attacks"] += unblocked

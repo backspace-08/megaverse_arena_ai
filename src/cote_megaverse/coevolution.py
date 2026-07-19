@@ -19,9 +19,9 @@ from tqdm import tqdm
 # Suppress numpy overflow warnings during sigmoid evaluation (handled via clipping in _p())
 warnings.filterwarnings('ignore', category=RuntimeWarning, message='.*overflow.*exp.*')
 
-_this_dir = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(_this_dir, "parameterized_ai"))
-from parameterized_ai_v2 import (BattleEngineV2, BattleAction, Player, Character,
+_project_root = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+_artifacts_dir = os.path.join(_project_root, "artifacts")
+from .parameterized_ai_v2 import (BattleEngineV2, BattleAction, Player, Character,
                                  CharType, get_type_multiplier, random_team,
                                  MAX_BONUS_ACTIONS, MAX_BASE_ACTIONS, MAX_TOTAL_ACTIONS,
                                  ACTION_COST_SWITCH,
@@ -1759,7 +1759,7 @@ def run_coevolution(pop_size=500, generations=100, games_per_eval=30,
     """
     # Setup timestamp and battle log directory
     run_timestamp = time.strftime("%Y%m%d_%H%M%S")
-    battle_log_dir = os.path.join(_this_dir, "parameterized_ai", f"battles_{run_timestamp}")
+    battle_log_dir = os.path.join(_artifacts_dir, f"battles_{run_timestamp}")
     os.makedirs(battle_log_dir, exist_ok=True)
     
     n_jobs = max(1, mp.cpu_count() if n_jobs == 0 else n_jobs)
@@ -2159,7 +2159,7 @@ def run_smart_coevolution(pop_size=240, generations=120, games_per_eval=30,
     Evolution only tunes base preferences and reaction strengths.
     """
     run_timestamp = time.strftime("%Y%m%d_%H%M%S")
-    battle_log_dir = os.path.join(_this_dir, "parameterized_ai", f"battles_{run_timestamp}")
+    battle_log_dir = os.path.join(_artifacts_dir, f"battles_{run_timestamp}")
     os.makedirs(battle_log_dir, exist_ok=True)
 
     n_jobs = max(1, mp.cpu_count() if n_jobs == 0 else n_jobs)
@@ -2356,7 +2356,7 @@ def run_smart_coevolution(pop_size=240, generations=120, games_per_eval=30,
 
 if __name__ == "__main__":
     run_ts = time.strftime("%Y%m%d_%H%M%S")
-    log_dir = os.path.join(_this_dir, "parameterized_ai")
+    log_dir = _artifacts_dir
     log_file = os.path.join(log_dir, f"training_{run_ts}.log")
 
     class TeeOutput:
@@ -2402,7 +2402,7 @@ if __name__ == "__main__":
           f"overAct={champ_info['overkill']:.1f} missLeth={champ_info['missed_lethal']:.1f}/g "
           f"resEff={champ_info['resource_eff']:.0f}")
 
-    ai_dir = os.path.join(_this_dir, "parameterized_ai")
+    ai_dir = _artifacts_dir
     timestamp = time.strftime("%Y%m%d_%H%M%S")
 
     version_info = {

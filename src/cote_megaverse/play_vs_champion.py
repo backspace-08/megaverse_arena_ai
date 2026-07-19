@@ -4,23 +4,24 @@ Clean version with proper turn-by-turn display.
 """
 import sys, os, random, json, itertools
 from datetime import datetime
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'parameterized_ai'))
 import numpy as np
-from coevolution import NeuralAgent, SmartNeuralAgent
-from parameterized_ai_v2 import (BattleEngineV2, BattleAction, Player, Character,
+from .coevolution import NeuralAgent, SmartNeuralAgent
+from .parameterized_ai_v2 import (BattleEngineV2, BattleAction, Player, Character,
                                  CharType, get_type_multiplier, random_team, make_character,
                                  MAX_BONUS_ACTIONS, MAX_TOTAL_ACTIONS, ACTION_COST_SWITCH, BASE_HP, TURN_ACTIONS,
-                                 TurnLog, AIProfile, WeightedRandomAIv2, CounterAI, AdaptiveAI)
+                                 TurnLog, AIProfile, WeightedRandomAIv2, CounterAI, AdaptiveAI,
+                                 calculate_damage, round_damage)
 
 EMOJI = {CharType.A: "[A]", CharType.B: "[B]", CharType.C: "[C]", CharType.D: "[D]"}
 TYPE_NAMES = {CharType.A: "Artist", CharType.B: "Brawler", CharType.C: "Coordinator", CharType.D: "Defender"}
+_project_root = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+_artifacts_dir = os.path.join(_project_root, "artifacts")
 
 class PlayerQuit(Exception):
     pass
 
 def list_versions():
-    base = os.path.dirname(os.path.abspath(__file__))
-    versions_path = os.path.join(base, 'parameterized_ai', 'versions.json')
+    versions_path = os.path.join(_artifacts_dir, 'versions.json')
     if not os.path.exists(versions_path):
         return []
     try:
@@ -37,8 +38,7 @@ def _load_agent(genome, name):
     return NeuralAgent(genome, name)
 
 def load_champion():
-    base = os.path.dirname(os.path.abspath(__file__))
-    ai_dir = os.path.join(base, 'parameterized_ai')
+    ai_dir = _artifacts_dir
     versions = list_versions()
     
     if versions:
@@ -71,7 +71,7 @@ def load_champion():
     path = os.path.join(ai_dir, 'best_genome.npy')
     if os.path.exists(path):
         return _load_agent(np.load(path), "Champion")
-    from coevolution import random_genome, random_smart_genome
+    from .coevolution import random_genome, random_smart_genome
     print("best_genome.npy NOT FOUND -- using random agent!")
     return _load_agent(random_smart_genome(), "Random")
 
@@ -165,17 +165,15 @@ def run_game(human, champion, team_human, team_ai, human_first=True):
         total_dmg = 0
         atk_char = player.active_character
         
-        # Consume opponent's shields
-        opponent.shields = max(0, opponent.shields - blocked_count)
+        # Shields protect only this immediately following turn and then burn
+        # completely, even when the opponent made no attacks.
+        opponent.shields = 0
         
         if unblocked > 0 and opponent.active_character.is_alive():
-            mult = get_type_multiplier(atk_char.char_type, opponent.active_character.char_type)
-            dmg_per_hit = int(atk_char.atk * mult)
-            for _ in range(unblocked):
-                if not opponent.active_character.is_alive():
-                    break
-                actual = opponent.active_character.take_damage(dmg_per_hit)
-                total_dmg += actual
+            total_dmg = calculate_damage(
+                atk_char, opponent.active_character, atk_count, blocked_count)
+            total_dmg = min(total_dmg, opponent.active_character.hp)
+            opponent.active_character.take_damage(total_dmg)
         
         if not opponent.active_character.is_alive():
             opponent.force_switch_from_death()
@@ -249,7 +247,7 @@ def run_game(human, champion, team_human, team_ai, human_first=True):
         return my_p, opp_p
     
     def show_turn_summary(player, opponent, log, label):
-        """Show attacks+damage, switch, bonuses, shields. Shields/bonuses hidden during turn, revealed after."""
+        """Show resolved actions and the one-turn shield exchange."""
         print()
         print("-" * 40)
         print(f"  {label} turn #{turn_num}")
@@ -262,28 +260,22 @@ def run_game(human, champion, team_human, team_ai, human_first=True):
             print(f"  {label} switched")
         
         if atk_count > 0:
-            unblocked = log.unblocked_attacks if log.unblocked_attacks else 0
-            blocked_count = max(0, atk_count - unblocked)
-            if blocked_count > 0:
-                reveal = f" (opponent had {log.opponent_shields} shields)" if label == "You" else ""
-                if unblocked > 0:
-                    print(f"  {label} attacked {atk_count}x: {blocked_count} blocked{reveal}, {unblocked} hit: {total_dmg} dmg")
-                else:
-                    print(f"  {label} attacked {atk_count}x: all blocked{reveal}")
-            else:
-                print(f"  {label} attacked {atk_count}x: {total_dmg} dmg")
+            unblocked = log.unblocked_attacks or 0
+            blocked_count = log.blocked_shields
+            print(f"  {label}: {atk_count} attacks vs {log.opponent_shields} shields: "
+                  f"{blocked_count} blocked, {unblocked} hit, {total_dmg} dmg")
         elif log.defend_actions > 0 or log.bonus_actions > 0:
             bonus_info = f" (gained {log.bonus_actions} bonus)" if log.bonus_actions > 0 else ""
             print(f"  {label} did not attack{bonus_info}")
         
         if atk_count == 0 and log.defend_actions == 0 and log.bonus_actions == 0 and not log.switched:
             print(f"  {label} did nothing")
-        
-        if label == "You":
-            remaining = log.player_shields_before
-            new_shields = player.shields
-            if remaining > 0 or new_shields > 0:
-                print(f"  Your shields: {remaining} remaining, set {new_shields}")
+
+        # The shield result is public after the turn resolves, even when no
+        # attacks occurred. It describes the target's shields consumed by
+        # this exchange, not a future action allocation.
+        shield_owner = "AI" if label == "You" else "You"
+        print(f"  {shield_owner} spent shields: {log.opponent_shields}")
     
     # === GAME LOOP ===
     setup_turn(p1, 1)
@@ -473,8 +465,7 @@ class HumanInputAI:
         return actions
 
 
-STATS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                          'parameterized_ai', 'play_stats.json')
+STATS_FILE = os.path.join(_artifacts_dir, 'play_stats.json')
 
 def play_vs_champion():
     """Play interactive games vs the evolved champion."""

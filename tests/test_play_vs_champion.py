@@ -2,10 +2,18 @@
 Tests for play_vs_champion.py (interactive game + benchmark).
 """
 import sys, os, json, io, unittest
+from contextlib import redirect_stdout
 from unittest.mock import patch, MagicMock
 import numpy as np
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "parameterized_ai"))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(PROJECT_ROOT, "src"))
+import cote_megaverse.parameterized_ai_v2 as _mechanics
+import cote_megaverse.coevolution as _coevolution
+import cote_megaverse.play_vs_champion as _play
+sys.modules["parameterized_ai_v2"] = _mechanics
+sys.modules["coevolution"] = _coevolution
+sys.modules["play_vs_champion"] = _play
 
 # ── helpers ──────────────────────────────────────────────────────
 
@@ -24,7 +32,7 @@ def _write_versions(versions, path):
 # ── Tests ────────────────────────────────────────────────────────
 
 class TestListVersions(unittest.TestCase):
-    VERSIONS_PATH = os.path.join("parameterized_ai", "versions.json")
+VERSIONS_PATH = os.path.join("artifacts", "versions.json")
 
     def setUp(self):
         self._has_real = os.path.exists(self.VERSIONS_PATH)
@@ -65,8 +73,8 @@ class TestListVersions(unittest.TestCase):
 
 
 class TestLoadChampion(unittest.TestCase):
-    VERSIONS_PATH = os.path.join("parameterized_ai", "versions.json")
-    NPY_PATH = os.path.join("parameterized_ai", "best_genome.npy")
+    VERSIONS_PATH = os.path.join("artifacts", "versions.json")
+    NPY_PATH = os.path.join("artifacts", "best_genome.npy")
 
     def setUp(self):
         # Tests may create or rename these files, so preserve real training output.
@@ -109,7 +117,7 @@ class TestLoadChampion(unittest.TestCase):
         from play_vs_champion import load_champion
         data = _make_versions(1)
         _write_versions(data, self.VERSIONS_PATH)
-        npy_path = os.path.join("parameterized_ai", f"best_genome_{data[0]['timestamp']}.npy")
+        npy_path = os.path.join("artifacts", f"best_genome_{data[0]['timestamp']}.npy")
         np.save(npy_path, np.arange(12, dtype=np.float32))
         try:
             with patch("builtins.input", return_value="1"):
@@ -338,6 +346,23 @@ class TestRunGameMechanics(unittest.TestCase):
         self.assertTrue(any(t.blocked_shields > 0 for t in atk_logs),
                         "expected some attacks to be blocked by shields")
 
+    def test_shield_spent_result_is_reported_even_without_attacks(self):
+        """Resolved shield allocation is public, including a zero exchange."""
+        from play_vs_champion import run_game
+
+        output = io.StringIO()
+        with redirect_stdout(output):
+            run_game(_ScriptedAI("defend", "You"),
+                     _ScriptedAI("defend", "AI"),
+                     self.team, self.team, human_first=True)
+
+        text = output.getvalue()
+        self.assertIn("AI spent shields: 0", text)
+        self.assertIn("You spent shields: 0", text)
+        self.assertIn("AI spent shields: 2", text)
+        self.assertIn("You spent shields: 2", text)
+        self.assertNotIn("set shields for the opponent's next turn", text)
+
     def test_bonus_banking_capped(self):
         """Bonus banker never exceeds MAX_BONUS_ACTIONS in run_game."""
         from play_vs_champion import run_game
@@ -564,7 +589,7 @@ class TestHumanInputAI(unittest.TestCase):
 
 
 class TestStats(unittest.TestCase):
-    STATS_PATH = os.path.join("parameterized_ai", "play_stats.json")
+    STATS_PATH = os.path.join("artifacts", "play_stats.json")
 
     def setUp(self):
         self._stats_backup = None
@@ -597,7 +622,7 @@ class TestStats(unittest.TestCase):
     def test_load_stats_corrupt_file(self):
         """Corrupt JSON returns [] instead of crashing."""
         from play_vs_champion import load_play_stats
-        spath = os.path.join("parameterized_ai", "play_stats.json")
+        spath = os.path.join("artifacts", "play_stats.json")
         with open(spath, "w") as f:
             f.write("{not valid json")
         try:
@@ -623,7 +648,7 @@ class TestStats(unittest.TestCase):
                    "anchors": [{"name": "AllIn", "won": 3, "lost": 1},
                                {"name": "Defender", "won": 2, "lost": 2}]}
         save_play_stats(session)
-        spath = os.path.join("parameterized_ai", "play_stats.json")
+        spath = os.path.join("artifacts", "play_stats.json")
         captured = io.StringIO()
         old = sys.stdout
         sys.stdout = captured

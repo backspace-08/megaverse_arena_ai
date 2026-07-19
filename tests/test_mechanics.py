@@ -4,7 +4,12 @@ Tests verify: action progression, shields, damage, type advantages,
 switching, turn order, and display correctness.
 """
 import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'parameterized_ai'))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(PROJECT_ROOT, "src"))
+import cote_megaverse.parameterized_ai_v2 as _mechanics
+import cote_megaverse.coevolution as _coevolution
+sys.modules["parameterized_ai_v2"] = _mechanics
+sys.modules["coevolution"] = _coevolution
 
 import numpy as np
 from parameterized_ai_v2 import (
@@ -170,11 +175,11 @@ def test_shields():
     unblocked = max(0, atk_count - shields)
     check("3 attacks vs 0 shields: all unblocked", unblocked == 3, f"got {unblocked}")
 
-    # Shield consumption: shields -= blocked
+    # Shields are fully consumed after the protected exchange.
     shields = 3
     blocked = 2
-    remaining = max(0, shields - blocked)
-    check("Shields 3, blocked 2, remaining 1", remaining == 1, f"got {remaining}")
+    remaining = 0
+    check("Shields 3, blocked 2, remaining 0", remaining == 0, f"got {remaining}")
 
 
 # ============================================================
@@ -260,6 +265,14 @@ def test_engine_shield_blocks():
     check("3 attacks vs 2 shields: unblocked=1", result_log.unblocked_attacks == 1,
           f"got {result_log.unblocked_attacks}")
     check("Opponent shields consumed: 2 to 0", p2.shields == 0, f"got {p2.shields}")
+
+    # A shield wall also burns when the protected turn contains no attacks.
+    p2.shields = 4
+    empty_log = engine._execute_turn(p1, p2, [])
+    check("4 shields with no incoming attacks: consumed to 0", p2.shields == 0,
+          f"got {p2.shields}")
+    check("No incoming attacks: blocked=0", empty_log.blocked_shields == 0,
+          f"got {empty_log.blocked_shields}")
 
 
 # ============================================================
@@ -456,7 +469,8 @@ def test_shield_is_player_level():
     p.shields = 3
     check("Player shields = 3", p.shields == 3)
 
-    # Shields persist when switching
+    # Shields remain attached to the player until the protected exchange;
+    # switching does not move them to a character.
     p.remaining_actions = 1
     p.switch_character(1)
     check("After switch: shields still 3", p.shields == 3)

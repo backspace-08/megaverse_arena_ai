@@ -5,7 +5,12 @@ import unittest
 
 import numpy as np
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "parameterized_ai"))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(PROJECT_ROOT, "src"))
+import cote_megaverse.parameterized_ai_v2 as _mechanics
+import cote_megaverse.coevolution as _coevolution
+sys.modules["parameterized_ai_v2"] = _mechanics
+sys.modules["coevolution"] = _coevolution
 
 from coevolution import (OpponentModel, PhaseShiftAI, SmartNeuralAgent,
                           compare_smart_genomes, random_smart_genome,

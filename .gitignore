@@ -3,14 +3,9 @@ __pycache__/
 .env
 
 # Generated models, weights and evolution metadata
-parameterized_ai/*.npy
-parameterized_ai/best_genome_*.json
-parameterized_ai/versions.json
-parameterized_ai/coevolution_result.json
-parameterized_ai/coevolution_stats.json
+artifacts/
 
 # Training output and recorded battles
-parameterized_ai/*.log
-parameterized_ai/battles_*/
-AGENT.MD
 parsing/
+docs/
+

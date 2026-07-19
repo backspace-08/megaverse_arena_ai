@@ -1,7 +1,6 @@
 """Battle of the anchors: WeightedRandomAIv2 profiles + CounterAI."""
 import sys, os, itertools, numpy as np
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'parameterized_ai'))
-from parameterized_ai_v2 import BattleEngineV2, WeightedRandomAIv2, CounterAI, AdaptiveAI, random_team, AIProfile
+from .parameterized_ai_v2 import BattleEngineV2, WeightedRandomAIv2, CounterAI, AdaptiveAI, random_team, AIProfile
 from collections import defaultdict
 
 ANCHORS = [
