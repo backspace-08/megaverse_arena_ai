@@ -1,2 +1,15 @@
 __pycache__/
+*.py[cod]
 .env
+
+# Generated models, weights and evolution metadata
+parameterized_ai/*.npy
+parameterized_ai/best_genome_*.json
+parameterized_ai/versions.json
+parameterized_ai/coevolution_result.json
+parameterized_ai/coevolution_stats.json
+
+# Training output and recorded battles
+parameterized_ai/*.log
+parameterized_ai/battles_*/
+AGENT.MD

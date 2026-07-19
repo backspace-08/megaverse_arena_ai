@@ -23,8 +23,12 @@ def list_versions():
     versions_path = os.path.join(base, 'parameterized_ai', 'versions.json')
     if not os.path.exists(versions_path):
         return []
-    with open(versions_path) as f:
-        return json.load(f)
+    try:
+        with open(versions_path, encoding="utf-8") as f:
+            versions = json.load(f)
+        return versions if isinstance(versions, list) else []
+    except (OSError, json.JSONDecodeError):
+        return []
 
 def _load_agent(genome, name):
     genome = np.asarray(genome, dtype=np.float32)
@@ -148,7 +152,7 @@ def run_game(human, champion, team_human, team_ai, human_first=True):
         atk_count = sum(1 for a in actions if a.action_type == "attack")
         def_count = sum(1 for a in actions if a.action_type == "defend")
         bon_count = sum(1 for a in actions if a.action_type == "bonus")
-        sw_count = 1 if (player.switched_this_round and not player.just_swapped_free) else 0
+        sw_count = 1 if (player.switched_this_round and not player.forced_switch_after_death) else 0
         
         total_actions = atk_count + def_count + bon_count
         player.remaining_actions -= total_actions
@@ -201,7 +205,8 @@ def run_game(human, champion, team_human, team_ai, human_first=True):
         print("=" * 55)
         
         # My team
-        for i, c in enumerate(my_p.characters):
+        for i in my_p.stack_order:
+            c = my_p.characters[i]
             mark = ">" if i == my_p.active_char_index else " "
             dead = "[X]" if not c.is_alive() else ""
             shield_s = f" [S]x{my_p.shields}" if i == my_p.active_char_index and my_p.shields > 0 else ""
@@ -213,7 +218,8 @@ def run_game(human, champion, team_human, team_ai, human_first=True):
         
         # Opponent team (shields hidden — fog of war)
         print(f"  ---- AI ----")
-        for i, c in enumerate(opp_p.characters):
+        for i in opp_p.stack_order:
+            c = opp_p.characters[i]
             mark = ">" if i == opp_p.active_char_index else " "
             dead = "[X]" if not c.is_alive() else ""
             print(f"  {mark} {EMOJI.get(c.char_type,'?')}#{i+1} {TYPE_NAMES.get(c.char_type,'?'):8s} "
@@ -361,7 +367,7 @@ def benchmark(agent, n=100):
                         switch_when_disadvantaged=True, w_switch=3))),
         ("Switcher", WeightedRandomAIv2(AIProfile("Switcher", w_attack=10, w_defend=1, w_bonus=2,
                         w_switch=8, switch_when_disadvantaged=True,
-                        switch_min_hp_ratio=0.8, aggressive_on_free_swap=True,
+                        switch_min_hp_ratio=0.8, aggressive_after_forced_switch=True,
                         save_first_turns=1))),
         ("Gambler", WeightedRandomAIv2(AIProfile("Gambler", w_attack=5, w_defend=5, w_bonus=5,
                        w_switch=5, switch_when_disadvantaged=True,
@@ -375,6 +381,10 @@ def benchmark(agent, n=100):
     for name, opp in opponents:
         w = 0
         for _ in range(n):
+            if hasattr(agent, "reset_state"):
+                agent.reset_state()
+            if hasattr(opp, "reset_state"):
+                opp.reset_state()
             t1, t2 = random_team(), random_team()
             if random.random() < 0.5:
                 e = BattleEngineV2(agent, opp, t1, t2)
@@ -438,8 +448,9 @@ class HumanInputAI:
                     print("  Not enough actions!")
                     continue
                 print("  Targets:")
-                for i, c in enumerate(player.characters):
-                    if c.is_alive() and i != player.active_char_index and not (player.switch_history and i == player.switch_history[-1]):
+                for i in player.stack_order:
+                    c = player.characters[i]
+                    if c.is_alive() and i != player.active_char_index:
                         adv_s = get_type_multiplier(c.char_type, opponent.active_character.char_type)
                         tag = "[OK]" if adv_s > 1.0 else ("[XX]" if adv_s < 1.0 else "--")
                         print(f"    [{i+1}] {EMOJI.get(c.char_type,'?')} {TYPE_NAMES.get(c.char_type,'?')} "
@@ -537,7 +548,7 @@ ANCHOR_PROFILES = [
                     switch_when_disadvantaged=True, w_switch=3)),
     ("Switcher", AIProfile("Switcher", w_attack=10, w_defend=1, w_bonus=2,
                     w_switch=8, switch_when_disadvantaged=True,
-                    switch_min_hp_ratio=0.8, aggressive_on_free_swap=True,
+                    switch_min_hp_ratio=0.8, aggressive_after_forced_switch=True,
                     save_first_turns=1)),
     ("Gambler",  AIProfile("Gambler",  w_attack=5, w_defend=5, w_bonus=5,
                     w_switch=5, switch_when_disadvantaged=True,

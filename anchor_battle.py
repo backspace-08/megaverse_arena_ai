@@ -13,7 +13,7 @@ ANCHORS = [
                                               switch_when_disadvantaged=True, w_switch=3))),
     ("Switcher", WeightedRandomAIv2(AIProfile("Switcher", w_attack=10, w_defend=1,  w_bonus=2,
                                               w_switch=8, switch_when_disadvantaged=True,
-                                              switch_min_hp_ratio=0.8, aggressive_on_free_swap=True,
+                                               switch_min_hp_ratio=0.8, aggressive_after_forced_switch=True,
                                               save_first_turns=1))),
     ("Gambler",  WeightedRandomAIv2(AIProfile("Gambler",  w_attack=5,  w_defend=5,  w_bonus=5,
                                               w_switch=5, switch_when_disadvantaged=True,

@@ -6,7 +6,7 @@ LSTM provides temporal memory; extra outputs predict opponent actions.
 4-turn opponent history enables pattern recognition for bluff detection.
 """
 
-import sys, os, random, math, json, time, warnings
+import sys, os, random, math, json, time, warnings, tempfile
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import List, Optional
@@ -39,7 +39,7 @@ ANCHOR_PROFILES = [
                               switch_when_disadvantaged=True, w_switch=3)),
     ("Switcher",    AIProfile("Switcher",    w_attack=10, w_defend=1,  w_bonus=2,
                               w_switch=8, switch_when_disadvantaged=True,
-                              switch_min_hp_ratio=0.8, aggressive_on_free_swap=True,
+                              switch_min_hp_ratio=0.8, aggressive_after_forced_switch=True,
                               save_first_turns=1)),
     ("Gambler",     AIProfile("Gambler",     w_attack=5,  w_defend=5,  w_bonus=5,
                               w_switch=5, switch_when_disadvantaged=True,
@@ -48,6 +48,32 @@ ANCHOR_PROFILES = [
                               w_switch=1, switch_when_disadvantaged=True,
                               bonus_target=4, switch_min_hp_ratio=0.3)),
 ]
+
+
+class PhaseShiftAI:
+    """Deterministic opponent that changes policy during one game.
+
+    Fixed anchors test counter-play against known styles. This opponent tests
+    whether the agent notices a style change instead of committing to one reply.
+    """
+    def __init__(self):
+        self.name = "PhaseShift"
+        self._turns = 0
+
+    def reset_state(self):
+        self._turns = 0
+
+    def choose_actions(self, player, opponent, turn_num, turn_logs, player_id):
+        my_turns = sum(1 for t in turn_logs if t.player_id == player_id)
+        if my_turns < 2:
+            profile = AIProfile("PhaseSave", w_attack=1, w_defend=1, w_bonus=16,
+                                bonus_target=4)
+        elif my_turns < 4:
+            profile = AIProfile("PhaseGuard", w_attack=2, w_defend=14, w_bonus=1)
+        else:
+            profile = AIProfile("PhasePress", w_attack=16, w_defend=1, w_bonus=0)
+        return WeightedRandomAIv2(profile).choose_actions(
+            player, opponent, turn_num, turn_logs, player_id)
 
 # CounterAI and AdaptiveAI are NOT WeightedRandomAIv2 — handled separately in _eval_worker.
 
@@ -100,6 +126,50 @@ N_OUT = 8   # 4 action probs + 4 predicted opponent actions
 
 SMART_GENOME_SIZE = 12
 
+
+def _load_json_or_default(path, default):
+    """Read a JSON artifact defensively after an interrupted previous run."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, PermissionError, json.JSONDecodeError, OSError):
+        return default
+
+
+def _write_json_atomic(path, value, **dump_kwargs):
+    """Write JSON through a sibling temporary file and replace atomically."""
+    directory = os.path.dirname(path) or "."
+    fd, temp_path = tempfile.mkstemp(prefix=".json-", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(value, f, **dump_kwargs)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, path)
+    except Exception:
+        try:
+            os.unlink(temp_path)
+        except FileNotFoundError:
+            pass
+        raise
+
+# Production profile for the smart co-evolution run. Reference games are kept
+# separate from self-play games because they are the anti-specialization test.
+SMART_PRODUCTION_CONFIG = {
+    "pop_size": 240,
+    "generations": 120,
+    "games_per_eval": 30,
+    "elite_frac": 0.07,
+    "mut_rate": 0.15,
+    "mut_sigma": 0.15,
+    "n_jobs": 8,
+    "hof_add": 12,
+    "hof_ratio": 0.25,
+    "hof_max": 200,
+    "reference_games": 8,
+    "snapshot_interval": 10,
+}
+
 # Parameter indices for smart agent
 SG_ADAPT      = 0   # opponent model update speed (0=slow, 1=fast)
 SG_AGGRO      = 1   # attack vs defend preference (0=shield, 1=attack)
@@ -137,7 +207,8 @@ class OpponentModel:
         self.atk_p = 0.33
         self.def_p = 0.33
         self.bon_p = 0.33
-        self.est_bonus_bank = 0.0
+        self.est_bonus_bank = 0
+        self.est_current_shields = 0
 
         # N-gram: last 4 opponent turns (atk, def, bon, switched)
         self.history = []
@@ -147,59 +218,54 @@ class OpponentModel:
         self.consecutive_bonus = 0
         self.last_was_attack_wave = False
         self.opponent_job_changed = False  # detected strategy shift
+        self._seen_turns = set()
 
     def update(self, turn_logs, player_id):
         opp_turns = [t for t in turn_logs if t.player_id != player_id]
-        if not opp_turns:
-            return
-        t = opp_turns[-1]
-        total = t.attack_actions + t.defend_actions + t.bonus_actions
-        if total == 0:
-            return
+        new_turns = [t for t in opp_turns if t.turn_num not in self._seen_turns]
+        for t in new_turns:
+            self._seen_turns.add(t.turn_num)
+            total = t.attack_actions + t.defend_actions + t.bonus_actions
+            if total == 0:
+                continue
 
-        atk_r = t.attack_actions / total
-        def_r = t.defend_actions / total
-        bon_r = t.bonus_actions / total
+            atk_r = t.attack_actions / total
+            def_r = t.defend_actions / total
+            bon_r = t.bonus_actions / total
 
-        a = self.adapt_speed
-        ema_old_atk = self.atk_p
-        self.atk_p = self.atk_p * (1.0 - a) + atk_r * a
-        self.def_p = self.def_p * (1.0 - a) + def_r * a
-        self.bon_p = self.bon_p * (1.0 - a) + bon_r * a
-        s = self.atk_p + self.def_p + self.bon_p
-        self.atk_p /= s; self.def_p /= s; self.bon_p /= s
+            a = self.adapt_speed
+            ema_old_atk = self.atk_p
+            self.atk_p = self.atk_p * (1.0 - a) + atk_r * a
+            self.def_p = self.def_p * (1.0 - a) + def_r * a
+            self.bon_p = self.bon_p * (1.0 - a) + bon_r * a
+            s = self.atk_p + self.def_p + self.bon_p
+            self.atk_p /= s; self.def_p /= s; self.bon_p /= s
+            self.opponent_job_changed = abs(self.atk_p - ema_old_atk) > 0.2
 
-        # Detect strategy shift: EMA changed by >20% in one update
-        self.opponent_job_changed = abs(self.atk_p - ema_old_atk) > 0.2
+            # A bonus action is publicly observable and is spent on the opponent's
+            # next turn, so its current bank can be tracked exactly.
+            self.est_bonus_bank = min(MAX_BONUS_ACTIONS, t.bonus_actions)
+            self.est_current_shields = t.defend_actions
 
-        # Bonus bank estimate: +bonus when opponent banks, -bonus when they spend on attacks
-        self.est_bonus_bank = min(1.0, self.est_bonus_bank + bon_r * 0.25)
-        if atk_r > 0.6 and self.est_bonus_bank > 0:
-            self.est_bonus_bank = max(0.0, self.est_bonus_bank - 0.15)
+            self.history.append((t.attack_actions, t.defend_actions, t.bonus_actions, 1 if t.switched else 0))
+            if len(self.history) > 4:
+                self.history.pop(0)
 
-        # N-gram: store action vector
-        self.history.append((t.attack_actions, t.defend_actions, t.bonus_actions, 1 if t.switched else 0))
-        if len(self.history) > 4:
-            self.history.pop(0)
+            if t.bonus_actions > 0 and t.attack_actions == 0:
+                self.consecutive_bonus = min(3, self.consecutive_bonus + 1)
+            elif t.attack_actions > 0:
+                self.consecutive_bonus = max(0, self.consecutive_bonus - 1)
 
-        # Consecutive bonus tracking
-        if t.bonus_actions > 0 and t.attack_actions == 0:
-            self.consecutive_bonus = min(3, self.consecutive_bonus + 1)
-        elif t.attack_actions > 0:
-            self.consecutive_bonus = max(0, self.consecutive_bonus - 1)
+            self.last_was_attack_wave = t.attack_actions >= 4
 
-        # Burst risk: probability opponent will dump banked actions into attacks
         risk = 0.0
-        if self.consecutive_bonus >= 2 and t.attack_actions == 0:
-            risk = 0.6 + 0.1 * self.consecutive_bonus
-        elif self.est_bonus_bank > 0.6:
-            risk = 0.4
+        if self.est_bonus_bank >= 3:
+            risk = 0.85
+        elif self.est_bonus_bank >= 2:
+            risk = 0.65
         elif self.consecutive_bonus >= 2:
-            risk = 0.5
+            risk = 0.50
         self.burst_risk = risk
-
-        # Attack wave detection
-        self.last_was_attack_wave = t.attack_actions >= 4
 
 
 
@@ -214,6 +280,7 @@ class SmartNeuralAgent:
         self.name = name
         self.opp_model = OpponentModel(self._p(SG_ADAPT, 0.3))
         self._last_attack_count = 0
+        self._action_counts = [0, 0, 0, 0]
         self.reset_state()
 
     def _p(self, idx, default=0.5):
@@ -246,10 +313,36 @@ class SmartNeuralAgent:
         w_atk, w_def, w_bon = self._compute_weights(player, opponent, turn_num, om)
 
         # 4. Expectimax: generate candidates, evaluate against opponent model, pick best
-        n_attack, n_defend, n_bonus = self._expectimax_best(remaining, player, opponent, w_atk, w_def, w_bon, om)
+        n_attack, n_defend, n_bonus = self._expectimax_best(
+            remaining, player, opponent, turn_num, w_atk, w_def, w_bon, om)
+
+        # If the current wall blocks the whole turn, do not spend the turn on
+        # guaranteed zero-damage attacks. Bank the available actions instead;
+        # the next expanded turn can then use the existing breakthrough rule.
+        max_bonus = MAX_BONUS_ACTIONS - player.bonus_actions
+        if (om.est_current_shields >= remaining and max_bonus > 0
+                and om.def_p > 0.55 and om.atk_p < 0.35
+                and om.burst_risk < 0.55):
+            n_bonus = min(remaining, max_bonus)
+            n_attack = remaining - n_bonus
+            n_defend = 0
+
+        # Break shield deadlocks. If the opponent has just shown a large shield
+        # wall but is not preparing an attack, spend enough actions to get through
+        # it instead of repeatedly defending and banking forever.
+        if (om.est_current_shields > 0 and om.est_current_shields < remaining
+                and om.def_p > 0.55
+                and om.atk_p < 0.35 and om.burst_risk < 0.55):
+            breakthrough = min(remaining, om.est_current_shields + 1)
+            if breakthrough > n_attack:
+                n_attack = breakthrough
+                spare = remaining - n_attack
+                n_defend = min(n_defend, spare)
+                n_bonus = min(n_bonus, spare - n_defend)
+                used = n_attack + n_defend + n_bonus
+                n_attack += remaining - used
 
         # 5. Cap bonus, overflow to attack
-        max_bonus = MAX_BONUS_ACTIONS - player.bonus_actions
         if n_bonus > max_bonus:
             n_attack += n_bonus - max_bonus
             n_bonus = max_bonus
@@ -271,117 +364,105 @@ class SmartNeuralAgent:
         for _ in range(n_bonus):
             actions.append(BattleAction("bonus", player.active_char_index))
         random.shuffle(actions)
+        self._action_counts[0] += n_attack
+        self._action_counts[1] += n_defend
+        self._action_counts[2] += n_bonus
+        self._action_counts[3] += int(did_switch)
         self._last_attack_count = n_attack
         return actions
 
     # ─── Expectimax 1-step ─────────────────────────────────────────
 
-    def _expectimax_best(self, remaining, player, opponent, w_atk, w_def, w_bon, om):
-        candidates = self._gen_candidates(remaining, w_atk, w_def, w_bon)
-        if len(candidates) <= 1:
-            return candidates[0] if candidates else (remaining, 0, 0)
+    def _expectimax_best(self, remaining, player, opponent, turn_num, w_atk, w_def, w_bon, om):
+        """Choose a full allocation using the real order of play.
 
+        Current attacks meet shields already set by the opponent. Current shields
+        only matter against their next turn, whose action budget is known from the
+        turn schedule plus their publicly observed bonus bank.
+        """
+        candidates = self._gen_candidates(remaining, player)
+        scenarios = self._opponent_scenarios(turn_num, om)
         my_char = player.active_character
         opp_char = opponent.active_character
         my_dmg = int(my_char.atk * get_type_multiplier(my_char.char_type, opp_char.char_type))
         opp_dmg = int(opp_char.atk * get_type_multiplier(opp_char.char_type, my_char.char_type))
+        total_weight = w_atk + w_def + w_bon
 
-        # Opponent's available actions on their next turn
-        opp_rem = opponent.remaining_actions
-
-        # Build opponent scenarios weighted by belief
-        scenarios = []
-
-        # Main: opponent follows their EMA tendency
-        s1a = max(0, int(opp_rem * om.atk_p))
-        s1d = max(0, int(opp_rem * om.def_p))
-        s1b = opp_rem - s1a - s1d
-        scenarios.append((0.50, s1a, s1d, max(0, s1b)))
-
-        # Aggressive: opponent attacks more than usual
-        if om.atk_p > 0.4:
-            s2a = max(0, int(opp_rem * min(1.0, om.atk_p * 1.4)))
-            s2d = max(0, int(opp_rem * 0.15))
-            s2b = opp_rem - s2a - s2d
-            scenarios.append((0.15, s2a, s2d, max(0, s2b)))
-
-        # Defensive: opponent shields heavily
-        if om.def_p > 0.3:
-            s3d = max(0, int(opp_rem * min(1.0, om.def_p * 2.0)))
-            s3a = max(0, int(opp_rem * 0.2))
-            s3b = opp_rem - s3a - s3d
-            scenarios.append((0.15, s3a, s3d, max(0, s3b)))
-
-        # Burst: opponent unloads bonus bank
-        if om.burst_risk > 0.3:
-            s4a = max(0, int(opp_rem * 0.75))
-            s4d = max(0, int(opp_rem * 0.15))
-            s4b = opp_rem - s4a - s4d
-            scenarios.append((om.burst_risk * 0.25, s4a, s4d, max(0, s4b)))
-
-        best_score = -10_000_000
+        best_score = -float("inf")
         best_dist = (remaining, 0, 0)
-
         for atk, df, bon in candidates:
             score = 0.0
-            for weight, oa, od, ob in scenarios:
-                net = self._eval_net(atk, df, bon, oa, od, ob, my_dmg, opp_dmg, player, opponent)
-                score += weight * net
+            for weight, opp_shields, opp_atk in scenarios:
+                score += weight * self._eval_net(
+                    atk, df, bon, opp_shields, opp_atk, my_dmg, opp_dmg, player, opponent)
 
+            # Genome preferences only break close tactical ties. They must never
+            # remove a legal counter-play from the search space.
+            if total_weight > 0:
+                prior = (atk * w_atk + df * w_def + bon * w_bon) / total_weight
+                score += prior * 35.0
+
+            # A shield-heavy opponent creates a preparation window. Repeating
+            # defense into that window is a deadlock; bank actions so the next
+            # unshielded turn can break through with tempo.
+            if om.def_p > 0.40:
+                score += bon * my_dmg * (0.55 + 1.25 * om.def_p)
+                score -= df * my_dmg * 0.35 * om.def_p
             if score > best_score:
                 best_score = score
                 best_dist = (atk, df, bon)
-
         return best_dist
 
-    def _eval_net(self, my_atk, my_def, my_bon, opp_atk, opp_def, opp_bon,
-                   my_dmg, opp_dmg, player, opponent):
-        """Expected net advantage: damage dealt + shield value + bonus future - damage taken."""
-        unblocked = max(0, my_atk - opp_def)
-        received = max(0, opp_atk - my_def)
-        dmg_dealt = unblocked * my_dmg
-        dmg_taken = received * opp_dmg
+    def _opponent_scenarios(self, turn_num, om):
+        """Return (probability, current_shields, next_turn_attacks) beliefs."""
+        next_base = min(TURN_ACTIONS.get(turn_num + 1, MAX_BASE_ACTIONS), MAX_TOTAL_ACTIONS)
+        next_actions = min(next_base + int(om.est_bonus_bank), MAX_TOTAL_ACTIONS)
+        expected_attacks = int(round(next_actions * om.atk_p))
+        current_shields = om.est_current_shields
+        calm_weight = 0.55 * (1.0 - 0.65 * om.burst_risk)
+        scenarios = [(calm_weight, current_shields, expected_attacks)]
 
-        # Shield value: each blocked attack preserves HP (proportional to opp's damage)
-        blocked = min(my_def, opp_atk)
-        shield_value = blocked * opp_dmg * 0.6
+        # A low-shield greedy line and a high-shield control line represent the
+        # uncertainty that cannot be observed before committing this allocation.
+        scenarios.append((0.20, current_shields,
+                          min(next_actions, max(expected_attacks, int(next_actions * 0.70)))))
+        scenarios.append((0.15, current_shields,
+                          max(0, int(next_actions * 0.25))))
+        if om.burst_risk > 0.0:
+            scenarios.append((0.15 + 0.60 * om.burst_risk, current_shields,
+                              min(next_actions, max(expected_attacks, int(next_actions * 0.80)))))
+
+        total = sum(weight for weight, _, _ in scenarios)
+        return [(weight / total, shields, attacks) for weight, shields, attacks in scenarios]
+
+    def _eval_net(self, my_atk, my_def, my_bon, opp_shields, opp_atk,
+                  my_dmg, opp_dmg, player, opponent):
+        """Two-phase tactical utility for this turn then the opponent's reply."""
+        unblocked = max(0, my_atk - opp_shields)
+        dealt = min(opponent.active_character.hp, unblocked * my_dmg)
+        received = min(player.active_character.hp, max(0, opp_atk - my_def) * opp_dmg)
+        score = dealt - received
+
+        # Removing an active character changes matchup and tempo, so a lethal is
+        # materially more valuable than its final hit alone. The symmetric penalty
+        # makes survival against a likely burst a first-class tactical objective.
+        if dealt >= opponent.active_character.hp:
+            score += BASE_HP * 0.70
+        if received >= player.active_character.hp:
+            score -= BASE_HP * 0.85
 
         bonus_gain = min(my_bon, MAX_BONUS_ACTIONS - player.bonus_actions)
-        bonus_future = bonus_gain * my_dmg * 0.55
+        # A stored action is useful but deliberately valued below guaranteed damage.
+        score += bonus_gain * my_dmg * 0.22
+        return score
 
-        return dmg_dealt + shield_value + bonus_future - dmg_taken
-
-    def _gen_candidates(self, remaining, w_atk, w_def, w_bon):
-        """Generate plausible action distributions around the weight-derived one."""
-        total = w_atk + w_def + w_bon
-        if total <= 0:
-            return [(remaining, 0, 0)]
-
-        base_atk = int(remaining * w_atk / total)
-        base_def = int(remaining * w_def / total)
-        base_bon = remaining - base_atk - base_def
-        if base_bon < 0: base_bon = 0; base_def = remaining - base_atk
-        if base_def < 0: base_def = 0; base_atk = remaining
-
-        seen = set()
-        cand = []
-        for d_atk in (-1, 0, 1, -2, 2):
-            for d_def in (-1, 0, 1, -2, 2):
-                a = base_atk + d_atk
-                d = base_def + d_def
-                b = remaining - a - d
-                if a < 0 or d < 0 or b < 0 or a > remaining or d > remaining:
-                    continue
-                if a + d + b != remaining:
-                    continue
-                key = (a, d, b)
-                if key not in seen:
-                    seen.add(key)
-                    cand.append((a, d, b))
-
-        # Sort by distance from base and keep top 15
-        cand.sort(key=lambda x: abs(x[0]-base_atk) + abs(x[1]-base_def))
-        return cand[:15]
+    def _gen_candidates(self, remaining, player):
+        """Enumerate every legal attack/defend/bonus allocation (at most 45)."""
+        max_bonus = MAX_BONUS_ACTIONS - player.bonus_actions
+        return [(atk, defend, remaining - atk - defend)
+                for atk in range(remaining + 1)
+                for defend in range(remaining - atk + 1)
+                if remaining - atk - defend <= max_bonus]
 
     # ─── Switch logic ──────────────────────────────────────────────
 
@@ -431,9 +512,6 @@ class SmartNeuralAgent:
         for i, c in enumerate(player.characters):
             if not c.is_alive() or i == player.active_char_index:
                 continue
-            if player.switch_history and i == player.switch_history[-1]:
-                continue
-
             mult = get_type_multiplier(c.char_type, opp_char.char_type)
             my_dmg = int(c.atk * mult)
             recv = int(opp_char.atk * get_type_multiplier(opp_char.char_type, c.char_type))
@@ -453,8 +531,6 @@ class SmartNeuralAgent:
         best_hp = -1
         for i, c in enumerate(player.characters):
             if not c.is_alive() or i == player.active_char_index:
-                continue
-            if player.switch_history and i == player.switch_history[-1]:
                 continue
             r = c.hp / c.max_hp
             if r > best_hp:
@@ -657,8 +733,6 @@ def get_state(player, opponent, turn_num, turn_logs=None, player_id=None):
     for i, c in enumerate(my_chars):
         if not c.is_alive() or i == player.active_char_index:
             continue
-        if player.switch_history and i == player.switch_history[-1]:
-            continue
         net = _expected_net_per_action(c, en_act)
         if net > best_net:
             best_net = net
@@ -696,7 +770,7 @@ def get_state(player, opponent, turn_num, turn_logs=None, player_id=None):
         opponent.bonus_actions / 4,           # 10
         player.remaining_actions / 8,         # 11
         player.base_actions / 8,              # 12
-        1.0 if player.just_swapped_free else 0.0,  # 13
+        1.0 if player.forced_switch_after_death else 0.0,  # 13
         my_bench_mult[0],                     # 14
         my_bench_mult[1],                     # 15
         opp_hist[0],                          # 16  opp turn -1: atk
@@ -874,8 +948,6 @@ class NeuralAgent:
         opp_char = opponent.active_character
         for i, c in enumerate(player.characters):
             if not c.is_alive() or i == player.active_char_index:
-                continue
-            if player.switch_history and i == player.switch_history[-1]:
                 continue
             net = _expected_net_per_action(c, opp_char)
             if best_idx is None or net > best_net:
@@ -1270,7 +1342,8 @@ def smart_classify_agent(genome, n_test_games=15):
 
 def _smart_eval_worker(args):
     """Worker for parallel smart agent evaluation — receives genome + opponents directly."""
-    genome_idx, genome, n_games, seed, hof_ratio, population, hall_of_fame = args
+    (genome_idx, genome, n_games, seed, hof_ratio, reference_games,
+     population, hall_of_fame) = args
     random.seed(seed)
     np.random.seed(seed)
 
@@ -1287,7 +1360,7 @@ def _smart_eval_worker(args):
     def _play_one(opp, label="pop"):
         nonlocal wins, total
         agent.reset_state()
-        if isinstance(opp, SmartNeuralAgent):
+        if hasattr(opp, "reset_state"):
             opp.reset_state()
         team1, team2 = random_team(), random_team()
         if np.random.random() < 0.5:
@@ -1313,31 +1386,44 @@ def _smart_eval_worker(args):
 
     for name, profile in ANCHOR_PROFILES:
         opp = WeightedRandomAIv2(profile)
-        for _ in range(3):
+        for _ in range(reference_games):
             _play_one(opp, f"anchor_{name}")
 
     opp_counter = CounterAI("Counter")
-    for _ in range(3): _play_one(opp_counter, "CounterAI")
+    for _ in range(reference_games): _play_one(opp_counter, "CounterAI")
 
     opp_adaptive = AdaptiveAI()
-    for _ in range(3): _play_one(opp_adaptive, "AdaptiveAI")
+    for _ in range(reference_games): _play_one(opp_adaptive, "AdaptiveAI")
+
+    opp_phase = PhaseShiftAI()
+    for _ in range(reference_games): _play_one(opp_phase, "PhaseShift")
 
     raw_winrate = wins / max(total, 1)
 
-    # Anti-specialization penalty
-    anchor_penalties = 0
-    for name, _ in ANCHOR_PROFILES:
-        key = f"anchor_{name}"
-        if opponent_wins[key][1] > 0:
-            if opponent_wins[key][0] / opponent_wins[key][1] < 0.20:
-                anchor_penalties += 1
-    penalty = max(0.4, 1.0 - anchor_penalties * 0.10)
-    adjusted_winrate = raw_winrate * penalty
+    # A champion must be robust, not merely exploit the average self-play agent.
+    # The lowest three anchor matchups receive a large weight in fitness.
+    reference_keys = [f"anchor_{name}" for name, _ in ANCHOR_PROFILES] + [
+        "CounterAI", "AdaptiveAI", "PhaseShift"]
+    reference_rates = [opponent_wins[key][0] / opponent_wins[key][1]
+                       for key in reference_keys if opponent_wins[key][1] > 0]
+    weak_matchups = sorted(reference_rates)[:3]
+    robust_rate = sum(weak_matchups) / max(1, len(weak_matchups))
+    adjusted_winrate = 0.60 * raw_winrate + 0.40 * robust_rate
+
+    # A one-dimensional action policy has no credible response to hidden intent.
+    # This is deliberately a soft penalty: tactical all-in is legal when needed,
+    # but a whole evaluation suite of all-in choices is not champion material.
+    total_actions = sum(agent._action_counts[:3])
+    if total_actions > 0:
+        max_action_ratio = max(agent._action_counts[:3]) / total_actions
+        if max_action_ratio > 0.90:
+            adjusted_winrate *= max(0.65, 1.0 - (max_action_ratio - 0.90) * 3.5)
 
     return genome_idx, adjusted_winrate
 
 
-def smart_evaluate_all(genomes, n_games=30, pool=None, hof_ratio=0.25, hall_of_fame=None, desc=None):
+def smart_evaluate_all(genomes, n_games=30, pool=None, hof_ratio=0.25,
+                       reference_games=8, hall_of_fame=None, desc=None):
     """Evaluate all smart agent genomes — passes genomes directly (no shared memory)."""
     hall_of_fame = hall_of_fame or []
     if pool is not None:
@@ -1348,14 +1434,17 @@ def smart_evaluate_all(genomes, n_games=30, pool=None, hof_ratio=0.25, hall_of_f
         batches = [range(i, min(i + batch_size, n_total)) for i in range(0, n_total, batch_size)]
         with tqdm(total=n_total, desc=desc, leave=False) as pbar:
             for batch in batches:
-                batch_args = [(i, genomes[i], n_games, i, hof_ratio, genomes, hall_of_fame) for i in batch]
+                batch_args = [(i, genomes[i], n_games, i, hof_ratio,
+                               reference_games, genomes, hall_of_fame) for i in batch]
                 raw = pool.map(_smart_eval_worker, batch_args)
                 for idx, fit in raw:
                     results[idx] = fit
                 pbar.update(len(batch))
         return results
     # Single-process fallback
-    raw = [_smart_eval_worker((i, genomes[i], n_games, i, hof_ratio, genomes, hall_of_fame)) for i in range(len(genomes))]
+    raw = [_smart_eval_worker((i, genomes[i], n_games, i, hof_ratio,
+                               reference_games, genomes, hall_of_fame))
+           for i in range(len(genomes))]
     results = [0.0] * len(genomes)
     for idx, fit in raw:
         results[idx] = fit
@@ -1384,7 +1473,7 @@ def _record_battle(genome, gen_num, timestamp, save_dir):
     lines.append(f"Turns: {result['turns']}")
     lines.append("")
     
-    for log in e.turn_logs:
+    for log in e.full_turn_logs:
         p_tag = f"P{log.player_id}"
         atk_str = f"atk={log.attack_actions}" if log.attack_actions else ""
         def_str = f"def={log.defend_actions}" if log.defend_actions else ""
@@ -1878,34 +1967,59 @@ def analyze_population(population, n_sample=30):
 # ============================================================
 
 def _smart_record_battle(genome, gen_num, timestamp, save_dir):
-    """Record a battle for the smart agent champion."""
+    """Record a readable battle report matching the play screen vocabulary."""
     agent = SmartNeuralAgent(genome, "champion")
     opp = SmartNeuralAgent(random_smart_genome(), "random")
     t1, t2 = random_team(), random_team()
     e = BattleEngineV2(agent, opp, t1, t2)
     result = e.run(50)
 
+    def team_lines(chars, hp_values, active, stack_order):
+        return [
+            f"    {'>' if i == active else ' '} [{chars[i].char_type.value}]#{i + 1} "
+            f"HP={hp_values[i]} ATK={chars[i].atk}"
+            for i in stack_order]
+
+    def action_line(log):
+        parts = []
+        if log.attack_actions:
+            blocked = log.blocked_shields
+            hit = log.unblocked_attacks
+            parts.append(f"attack {log.attack_actions}x ({blocked} blocked, {hit} hit)")
+        if log.defend_actions:
+            parts.append(f"shield {log.defend_actions}")
+        if log.bonus_actions:
+            parts.append(f"bonus +{log.bonus_actions}")
+        if log.switched:
+            parts.append("switch")
+        return ", ".join(parts) if parts else "pass"
+
     lines = []
-    lines.append(f"Battle: Gen {gen_num}")
-    lines.append(f"Teams: P1={[c.char_type.value for c in e.p1.characters]}")
-    lines.append(f"       P2={[c.char_type.value for c in e.p2.characters]}")
-    lines.append(f"Winner: Player {result['winner']}")
+    lines.append("=" * 72)
+    lines.append(f"COTE MEGAVERSE | EVOLUTION BATTLE | GENERATION {gen_num}")
+    lines.append("=" * 72)
+    lines.append(f"P1 champion: {[c.char_type.value for c in e.p1.characters]}")
+    lines.append(f"P2 opponent: {[c.char_type.value for c in e.p2.characters]}")
+    result_text = "draw" if result["winner"] == 0 else f"Player {result['winner']} wins"
+    lines.append(f"Result: {result_text}")
     lines.append(f"Turns: {result['turns']}")
+    lines.append("")
     for log in e.turn_logs:
-        p_tag = f"P{log.player_id}"
-        parts = [x for x in [
-            f"atk={log.attack_actions}" if log.attack_actions else "",
-            f"def={log.defend_actions}" if log.defend_actions else "",
-            f"bon={log.bonus_actions}" if log.bonus_actions else "",
-            "SWITCH" if log.switched else ""
-        ] if x]
-        dmg_str = f"dmg={log.total_damage}" if log.total_damage else ""
-        block_str = f"blocked={log.blocked_shields}/{log.opponent_shields}" if log.opponent_shields else ""
-        shield_str = f"my_shields={log.player_shields_before}" if log.player_shields_before else ""
-        detail = " | ".join(x for x in [dmg_str, block_str, shield_str] if x)
-        line = f"  T{log.turn_num:2d} {p_tag}: {', '.join(parts)}"
-        if detail: line += f" [{detail}]"
-        lines.append(line)
+        p1_active = log.p1_active if log.p1_active >= 0 else 0
+        p2_active = log.p2_active if log.p2_active >= 0 else 0
+        lines.append(f"TURN {log.turn_num:02d} | Player {log.player_id}")
+        lines.append(f"  Before P1: {log.p1_hp} | P2: {log.p2_hp}")
+        p1_stack = log.p1_stack or list(range(len(e.p1.characters)))
+        p2_stack = log.p2_stack or list(range(len(e.p2.characters)))
+        lines.append("  State P1:")
+        lines.extend(team_lines(e.p1.characters, log.p1_hp, p1_active, p1_stack))
+        lines.append("  State P2:")
+        lines.extend(team_lines(e.p2.characters, log.p2_hp, p2_active, p2_stack))
+        lines.append(f"  Action: {action_line(log)}")
+        lines.append(f"  Damage: {log.total_damage} | opponent shields: {log.opponent_shields} | own shields before: {log.player_shields_before}")
+        lines.append(f"  After  P1: {log.p1_hp_after} | P2: {log.p2_hp_after} "
+                     f"(active P1=#{log.p1_active_after + 1}, P2=#{log.p2_active_after + 1})")
+        lines.append("")
 
     battle_text = "\n".join(lines)
     filename = f"battle_gen{gen_num:04d}_{timestamp}.txt"
@@ -1916,19 +2030,28 @@ def _smart_record_battle(genome, gen_num, timestamp, save_dir):
     turns = [{"turn": t.turn_num, "player": t.player_id,
               "attacks": t.attack_actions, "defends": t.defend_actions,
               "bonuses": t.bonus_actions, "switched": t.switched,
-              "damage": t.total_damage, "unblocked": t.unblocked_attacks,
-              "blocked": t.blocked_shields, "opp_shields": t.opponent_shields}
-             for t in e.turn_logs]
+            "damage": t.total_damage, "unblocked": t.unblocked_attacks,
+            "blocked": t.blocked_shields, "opp_shields": t.opponent_shields,
+            "p1_hp": t.p1_hp, "p2_hp": t.p2_hp,
+            "p1_hp_after": t.p1_hp_after, "p2_hp_after": t.p2_hp_after,
+            "p1_active": t.p1_active, "p2_active": t.p2_active,
+            "p1_active_after": t.p1_active_after,
+            "p2_active_after": t.p2_active_after,
+            "p1_stack": t.p1_stack, "p2_stack": t.p2_stack,
+            "p1_stack_after": t.p1_stack_after,
+            "p2_stack_after": t.p2_stack_after}
+             for t in e.full_turn_logs]
     return {"gen": gen_num, "winner": result["winner"], "total_turns": result["turns"],
             "p1_team": [c.char_type.value for c in e.p1.characters],
             "p2_team": [c.char_type.value for c in e.p2.characters],
             "turns": turns, "file": filename}
 
 
-def run_smart_coevolution(pop_size=300, generations=80, games_per_eval=30,
+def run_smart_coevolution(pop_size=240, generations=120, games_per_eval=30,
                            elite_frac=0.07, mut_rate=0.15, mut_sigma=0.15,
-                           n_jobs=0, verbose=True,
-                           hof_add=12, hof_ratio=0.30, hof_max=200,
+                           n_jobs=8, verbose=True,
+                           hof_add=12, hof_ratio=0.25, hof_max=200,
+                           reference_games=8,
                            snapshot_interval=10):
     """Co-evolution with SmartNeuralAgent (12-param genome + opponent model).
     
@@ -1943,12 +2066,13 @@ def run_smart_coevolution(pop_size=300, generations=80, games_per_eval=30,
     os.makedirs(battle_log_dir, exist_ok=True)
 
     n_jobs = max(1, mp.cpu_count() if n_jobs == 0 else n_jobs)
-    n_anchors = len(ANCHOR_PROFILES) + 6
-    total_games_per = games_per_eval + n_anchors
+    reference_groups = len(ANCHOR_PROFILES) + 3
+    reference_total = reference_groups * reference_games
+    total_games_per = games_per_eval + reference_total
     total_battles = pop_size * generations * total_games_per
-    extra = f"+HoF({hof_ratio:.0%}) +{n_anchors}anchors"
+    extra = f"+HoF({hof_ratio:.0%}) +{reference_groups}refs*{reference_games}"
     print(f"Smart co-evolution: pop={pop_size}, gens={generations}, "
-          f"games={total_games_per} ({extra})", flush=True)
+          f"games/agent={total_games_per} ({extra})", flush=True)
     print(f"Genome size: {smart_genome_size()} params", flush=True)
     print(f"Workers: {n_jobs}", flush=True)
     print(f"Estimated battles: {total_battles:,}", flush=True)
@@ -1975,7 +2099,9 @@ def run_smart_coevolution(pop_size=300, generations=80, games_per_eval=30,
         for gen in range(generations):
             gen_t0 = time.perf_counter()
 
-            fitnesses = smart_evaluate_all(population, games_per_eval, pool=pool, hof_ratio=hof_ratio,
+            fitnesses = smart_evaluate_all(population, games_per_eval, pool=pool,
+                                           hof_ratio=hof_ratio,
+                                           reference_games=reference_games,
                                            hall_of_fame=hall_of_fame,
                                            desc=f"Eval gen {gen+1}")
 
@@ -2138,11 +2264,15 @@ if __name__ == "__main__":
     print("=" * 65)
     print(f"Log file: {log_file}\n")
 
-    # Run smart co-evolution (default params optimized for fast convergence)
+    # Run the production smart co-evolution profile.
     pop, hist, _, gen_stats, battle_records, facts = run_smart_coevolution()
 
     print("\nEvaluating final generation...")
-    final_fits = smart_evaluate_all(pop, 40)
+    final_fits = smart_evaluate_all(
+        pop,
+        n_games=40,
+        hof_ratio=SMART_PRODUCTION_CONFIG["hof_ratio"],
+        reference_games=SMART_PRODUCTION_CONFIG["reference_games"])
 
     best_idx = max(range(len(final_fits)), key=lambda i: final_fits[i])
     best_genome = pop[best_idx]
@@ -2163,33 +2293,33 @@ if __name__ == "__main__":
     version_info = {
         "timestamp": timestamp, "best_fitness": best_fitness,
         "generations": len(hist), "population_size": len(pop),
-        "params": "defaults (pop=300, gens=80, games=30, hof=200)",
+        "params": dict(SMART_PRODUCTION_CONFIG),
         "agent_type": "smart",
         "champion": {k: v for k, v in champ_info.items() if k != "archetype"},
         "archetype": champ_info["archetype"],
     }
 
     np.save(os.path.join(ai_dir, f"best_genome_{timestamp}.npy"), best_genome)
-    with open(os.path.join(ai_dir, f"best_genome_{timestamp}.json"), "w") as f:
-        json.dump(version_info, f, indent=2)
+    _write_json_atomic(
+        os.path.join(ai_dir, f"best_genome_{timestamp}.json"),
+        version_info, indent=2)
     np.save(os.path.join(ai_dir, "best_genome.npy"), best_genome)
 
     versions_path = os.path.join(ai_dir, "versions.json")
-    versions = []
-    if os.path.exists(versions_path):
-        with open(versions_path) as f: versions = json.load(f)
+    versions = _load_json_or_default(versions_path, [])
+    if not isinstance(versions, list):
+        versions = []
     versions.append(version_info)
-    with open(versions_path, "w") as f: json.dump(versions, f, indent=2)
+    _write_json_atomic(versions_path, versions, indent=2)
 
     result = {"best_fitness": best_fitness, "generations": len(hist),
               "population_size": len(pop),
               "fitness_history": [(float(b), float(a)) for b, a in hist]}
-    with open(os.path.join(ai_dir, "coevolution_result.json"), "w") as f:
-        json.dump(result, f, indent=2)
+    _write_json_atomic(os.path.join(ai_dir, "coevolution_result.json"), result, indent=2)
 
     print(f"Saved version {timestamp} (fitness={best_fitness:.1%})")
 
-    stats = {"config": "defaults (pop=300, gens=80, games=30, hof=200)",
+    stats = {"config": dict(SMART_PRODUCTION_CONFIG),
              "timestamp": timestamp,
              "genome_size": smart_genome_size(), "agent_type": "smart",
              "total_generations": len(hist),
@@ -2197,8 +2327,9 @@ if __name__ == "__main__":
              "final_avg_fitness": float(np.mean([f for _, f in hist])),
              "fitness_history": [{"gen": i+1, "best": float(b), "avg": float(a)} for i, (b, a) in enumerate(hist)],
              "gen_stats": gen_stats, "battle_records": battle_records, "facts": facts}
-    with open(os.path.join(ai_dir, "coevolution_stats.json"), "w") as f:
-        json.dump(stats, f, indent=2, ensure_ascii=False)
+    _write_json_atomic(
+        os.path.join(ai_dir, "coevolution_stats.json"),
+        stats, indent=2, ensure_ascii=False)
     print(f"Stats saved to {os.path.join(ai_dir, 'coevolution_stats.json')}")
 
     n_top = max(10, len(pop) // 10)

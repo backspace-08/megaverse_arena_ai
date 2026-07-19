@@ -285,7 +285,7 @@ def test_death_switch():
     check("After death: active is not c1", p.active_char_index != 0)
     check("After death: active char is alive",
           p.characters[p.active_char_index].is_alive())
-    check("After death: just_swapped_free=True", p.just_swapped_free is True)
+    check("After death: forced switch flag set", p.forced_switch_after_death is True)
 
 
 # ============================================================
@@ -319,13 +319,13 @@ def test_switch():
     ok3 = p2.switch_character(0)
     check("Switch to self: blocked", ok3 is False)
 
-    # Cannot switch to last in history (LIFO)
+    # Switching back is allowed on a later turn; only same-turn double switch is blocked.
     p3 = Player(1, [c1, c2, c3])
     p3.active_char_index = 1
     p3.remaining_actions = 3
     p3.switch_history = [0]
     ok4 = p3.switch_character(0)
-    check("LIFO: cannot switch back immediately", ok4 is False)
+    check("Switch back on later turn: allowed", ok4 is True)
 
 
 # ============================================================

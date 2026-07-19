@@ -1,7 +1,7 @@
 """
 v2 — правильная механика игры (как в COTE megaverse):
 - Проактивная защита: щиты ставятся на своём ходу, блокируют атаки на ходу противника
-- Смена при смерти = бесплатно
+- После смерти активного следующий живой персонаж продвигается автоматически
 - Все атаки бьют по активному персонажу
 - Блеф: выбор между shield/bonus без знания планов противника
 """
@@ -105,13 +105,16 @@ class Player:
     shields: int = 0          # щиты, поставленные на этом ходу (защита на ход противника)
     switched_this_round: bool = False
     switch_history: List[int] = field(default_factory=list)  # стек вытесненных персонажей (самый свежий — последний)
-    just_swapped_free: bool = False  # флаг для AI: только что зашёл по смерти
+    stack_order: List[int] = field(default_factory=list)  # visual/order stack; active is always first
+    forced_switch_after_death: bool = False
     _alive_cache: Optional[List[Character]] = field(default=None, repr=False)
     _alive_count: int = field(default=0, repr=False)
 
     def __post_init__(self):
         if self.characters:
             self.characters[0].is_active = True
+            if not self.stack_order:
+                self.stack_order = list(range(len(self.characters)))
             self._alive_count = sum(1 for c in self.characters if c.is_alive())
             self._alive_cache = None  # lazy init
 
@@ -136,14 +139,15 @@ class Player:
             return False
         if new_index == self.active_char_index:
             return False
-        if self.switch_history and new_index == self.switch_history[-1]:
-            return False  # нельзя вернуться к тому, кого только что вытеснил
         if not self.characters[new_index].is_alive():
             return False
         if self.remaining_actions < ACTION_COST_SWITCH:
             return False
         self.characters[self.active_char_index].is_active = False
-        self.switch_history.append(self.active_char_index)
+        previous = self.active_char_index
+        self.switch_history.append(previous)
+        self.stack_order.remove(new_index)
+        self.stack_order.insert(0, new_index)
         self.active_char_index = new_index
         self.characters[new_index].is_active = True
         self.switched_this_round = True
@@ -151,33 +155,30 @@ class Player:
         return True
 
     def force_switch_from_death(self):
-        """Принудительная смена при смерти активного — бесплатно.
-        Возвращается последний вытесненный через switch_history (LIFO)."""
+        """Promote the next living character after the active character dies."""
         # Деактивируем мёртвого
-        self.characters[self.active_char_index].is_active = False
+        dead_index = self.active_char_index
+        self.characters[dead_index].is_active = False
         self._alive_count -= 1
         self._invalidate_alive_cache()
-        # Ищем живого в стеке (с конца)
-        while self.switch_history:
-            idx = self.switch_history.pop()
-            if self.characters[idx].is_alive():
-                self.active_char_index = idx
-                self.characters[idx].is_active = True
-                self.switched_this_round = True
-                self.just_swapped_free = True
-                return
-        # Стек пуст или все мертвы — ищем любого живого
-        for i, c in enumerate(self.characters):
-            if c.is_alive() and i != self.active_char_index:
-                self.active_char_index = i
-                self.characters[i].is_active = True
-                self.switched_this_round = True
-                self.just_swapped_free = True
-                return
+        next_index = next((i for i in self.stack_order if i != dead_index and self.characters[i].is_alive()), None)
+        if next_index is None:
+            return
+
+        # The promoted character moves to the top; the dead active remains second.
+        self.stack_order.remove(next_index)
+        if dead_index in self.stack_order:
+            self.stack_order.remove(dead_index)
+        self.stack_order.insert(0, next_index)
+        self.stack_order.insert(1, dead_index)
+        self.active_char_index = next_index
+        self.characters[next_index].is_active = True
+        self.switched_this_round = True
+        self.forced_switch_after_death = True
 
     def reset_round_state(self):
         self.switched_this_round = False
-        self.just_swapped_free = False
+        self.forced_switch_after_death = False
         # switch_history НЕ сбрасывается — сохраняется до конца боя
 
 
@@ -205,6 +206,16 @@ class TurnLog:
     player_shields_before: int
     p1_hp: List[int]
     p2_hp: List[int]
+    p1_hp_after: List[int] = field(default_factory=list)
+    p2_hp_after: List[int] = field(default_factory=list)
+    p1_active: int = -1
+    p2_active: int = -1
+    p1_active_after: int = -1
+    p2_active_after: int = -1
+    p1_stack: List[int] = field(default_factory=list)
+    p2_stack: List[int] = field(default_factory=list)
+    p1_stack_after: List[int] = field(default_factory=list)
+    p2_stack_after: List[int] = field(default_factory=list)
 
 
 # ========================
@@ -237,8 +248,8 @@ class AIProfile:
     switch_min_hp_ratio: float = 0.3
     # Спасти первые N своих ходов
     save_first_turns: int = 0   # сколько своих ходов ничего не атаковать
-    # После бесплатной смены (смерти) — в атаку
-    aggressive_on_free_swap: bool = False
+    # После принудительного продвижения из-за смерти — в атаку
+    aggressive_after_forced_switch: bool = False
     # После большого залпа — поставить защиту
     defend_after_burst: bool = False
     # Количество щитов после залпа
@@ -290,8 +301,8 @@ class WeightedRandomAIv2:
             bonus = min(remaining, max_bonus_can_add)
             return self._build_actions(0, 0, bonus, player, opponent)
 
-        # Aggressive on free swap
-        if self.p.aggressive_on_free_swap and player.just_swapped_free:
+        # Aggressive after a forced promotion caused by active-character death
+        if self.p.aggressive_after_forced_switch and player.forced_switch_after_death:
             return self._build_actions(remaining, 0, 0, player, opponent)
 
         # Базовая аллокация по весам
@@ -373,8 +384,6 @@ class WeightedRandomAIv2:
         best_idx = None
         for i, char in enumerate(player.characters):
             if not char.is_alive() or i == player.active_char_index:
-                continue
-            if player.switch_history and i == player.switch_history[-1]:
                 continue
             score = char.hp / char.max_hp * 50
             for opp in alive_opps:
@@ -483,8 +492,6 @@ class CounterAI:
         for i, c in enumerate(player.characters):
             if not c.is_alive() or i == player.active_char_index:
                 continue
-            if player.switch_history and i == player.switch_history[-1]:
-                continue
             mult = get_type_multiplier(c.char_type, opp_type)
             if mult > best_adv:
                 best_adv = mult
@@ -499,6 +506,10 @@ class AdaptiveAI:
         self.memory = memory
         self.adapt_rate = adapt_rate
         self._opp_history: List[Dict] = []
+
+    def reset_state(self):
+        """Clear observations between independent games."""
+        self._opp_history.clear()
 
     def choose_actions(self, player: Player, opponent: Player,
                        turn_num: int, turn_logs: List[TurnLog],
@@ -591,8 +602,6 @@ class AdaptiveAI:
         for i, c in enumerate(player.characters):
             if not c.is_alive() or i == player.active_char_index:
                 continue
-            if player.switch_history and i == player.switch_history[-1]:
-                continue
             mult = get_type_multiplier(c.char_type, opp_type)
             if mult > best_adv:
                 best_adv = mult
@@ -608,7 +617,7 @@ class BattleEngineV2:
     """
     Движок с правильной механикой:
     - Защита проактивная (ставишь на своём ходу)
-    - Смена при смерти бесплатная
+    - После смерти активного следующий живой продвигается автоматически
     - Атака всегда по активному
     - Блеф: shield vs bonus
     """
@@ -623,6 +632,7 @@ class BattleEngineV2:
         self.turn_num = 0
         self.current_player = 1
         self.turn_logs: List[TurnLog] = []
+        self.full_turn_logs: List[TurnLog] = []
         self.stats = defaultdict(int)
         self.detailed_stats_p1 = {
             "overkill": 0, "counter_success": 0, "missed_lethal": 0,
@@ -664,6 +674,10 @@ class BattleEngineV2:
             self.p2_min_alive = min(self.p2_min_alive, len(self.p2.alive_characters))
             hp_before_p1 = [c.hp for c in self.p1.characters]
             hp_before_p2 = [c.hp for c in self.p2.characters]
+            active_before_p1 = self.p1.active_char_index
+            active_before_p2 = self.p2.active_char_index
+            stack_before_p1 = list(self.p1.stack_order)
+            stack_before_p2 = list(self.p2.stack_order)
 
             # AI выбирает действия
             actions = ai.choose_actions(player, opponent, self.turn_num,
@@ -675,15 +689,26 @@ class BattleEngineV2:
             log.player_id = self.current_player
             log.p1_hp = hp_before_p1
             log.p2_hp = hp_before_p2
+            log.p1_hp_after = [c.hp for c in self.p1.characters]
+            log.p2_hp_after = [c.hp for c in self.p2.characters]
+            log.p1_active = active_before_p1
+            log.p2_active = active_before_p2
+            log.p1_active_after = self.p1.active_char_index
+            log.p2_active_after = self.p2.active_char_index
+            log.p1_stack = stack_before_p1
+            log.p2_stack = stack_before_p2
+            log.p1_stack_after = list(self.p1.stack_order)
+            log.p2_stack_after = list(self.p2.stack_order)
             self.turn_logs.append(log)
+            self.full_turn_logs.append(log)
             # Keep only last 8 turns in memory (enough for 4-turn history + buffer)
             if len(self.turn_logs) > 8:
                 self.turn_logs = self.turn_logs[-8:]
 
             # Punished greed: current player attacked opponent; if opponent hoarded bonus
-            # and their character died (force_switch_from_death set just_swapped_free), track it
+            # and their active character died, track the successful punish.
             ds = self.detailed_stats_p1 if self.current_player == 1 else self.detailed_stats_p2
-            if self._last_bonus[opponent.player_id] > 0 and opponent.just_swapped_free:
+            if self._last_bonus[opponent.player_id] > 0 and opponent.forced_switch_after_death:
                 ds["punished_greed"] += 1
 
             # Track bonus hoarding for punished_greed detection next round
@@ -734,7 +759,7 @@ class BattleEngineV2:
         # Track voluntary switch (detect if AI switched inside choose_actions)
         did_switch = False
         swap_value = 0
-        if player.switched_this_round and not player.just_swapped_free:
+        if player.switched_this_round and not player.forced_switch_after_death:
             did_switch = True
             ds["n_switches"] += 1
             # Compute switch EV: net damage per action after vs before switch
@@ -837,7 +862,7 @@ class BattleEngineV2:
         return {
             "winner": winner,
             "rounds": self.round_num,
-            "turns": len(self.turn_logs),
+            "turns": len(self.full_turn_logs),
             "p1_final_hp": [c.hp for c in self.p1.characters],
             "p2_final_hp": [c.hp for c in self.p2.characters],
             "p1_min_alive": self.p1_min_alive,
