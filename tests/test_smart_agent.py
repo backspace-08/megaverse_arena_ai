@@ -2,6 +2,7 @@
 import sys
 import os
 import unittest
+import inspect
 
 import numpy as np
 
@@ -14,7 +15,12 @@ sys.modules["coevolution"] = _coevolution
 
 from coevolution import (OpponentModel, PhaseShiftAI, SmartNeuralAgent,
                           compare_smart_genomes, random_smart_genome,
-                          validate_smart_genome)
+                          validate_smart_genome, validate_smart_tasks,
+                          pairwise_smart_genome_matrix, HumanShieldBreakerAI,
+                          HardDefenderAI, BurstBankerAI, SwitchPunisherAI,
+                          TacticalBounds, exact_tactical_bounds,
+                          guaranteed_exchange_facts, controlled_fitness_scores)
+from cote_megaverse.planner_kernel import rank_macro_candidates, using_numba, resolve_numeric
 from parameterized_ai_v2 import Character, CharType, Player, TurnLog
 
 
@@ -109,6 +115,52 @@ class TestFixedValidation(unittest.TestCase):
         self.assertGreaterEqual(first["a_winrate"], 0.0)
         self.assertLessEqual(first["a_winrate"], 1.0)
 
+    def test_task_validation_reports_separate_tactical_suites(self):
+        report = validate_smart_tasks(random_smart_genome(seed=3), games=1)
+        self.assertEqual(set(report["tasks"]), {
+            "mechanics_validation", "shield_validation", "burst_validation",
+            "switch_validation", "human_strategy_validation",
+            "anti_counter_validation",
+        })
+        self.assertIn("HumanShieldBreaker", report["tasks"]["shield_validation"]["matchups"])
+        self.assertIn("confidence_interval_95",
+                      report["tasks"]["burst_validation"]["matchups"]["BurstBanker"])
+        self.assertGreaterEqual(report["overall"], 0.0)
+        self.assertLessEqual(report["overall"], 1.0)
+        self.assertIn("draw_rate", report["tasks"]["shield_validation"]["matchups"]["HumanShieldBreaker"])
+        self.assertIn("deadline_rate", report["tasks"]["shield_validation"]["matchups"]["HumanShieldBreaker"])
+        self.assertIn("draw_and_deadline_penalty", report["controlled_scores"])
+
+    def test_controlled_fitness_penalties_do_not_change_baseline(self):
+        scores = controlled_fitness_scores(0.8, 0.6, draw_rate=0.25,
+                                           deadline_rate=0.20)
+        self.assertAlmostEqual(scores["baseline"], 0.72)
+        self.assertLess(scores["draw_penalty"], scores["baseline"])
+        self.assertLess(scores["draw_and_deadline_penalty"], scores["draw_penalty"])
+
+    def test_pairwise_matrix_contains_outcomes_and_side_counts(self):
+        genomes = [random_smart_genome(seed=4), random_smart_genome(seed=5)]
+        report = pairwise_smart_genome_matrix(genomes, games=1)
+        pair = report["matrix"][0][1]
+        self.assertEqual(pair["games"], 1)
+        self.assertEqual(pair["wins"] + pair["losses"] + pair["draws"], 1)
+        self.assertEqual(sum(pair["side_counts"].values()), 1)
+        self.assertEqual(len(pair["confidence_interval_95"]), 2)
+
+    def test_hard_reference_factories_are_resettable(self):
+        for opponent_type in (HumanShieldBreakerAI, HardDefenderAI,
+                              BurstBankerAI, SwitchPunisherAI):
+            opponent = opponent_type()
+            self.assertTrue(hasattr(opponent, "reset_state"))
+            opponent.reset_state()
+
+    def test_evolution_does_not_expose_battle_persistence_helpers(self):
+        self.assertFalse(hasattr(_coevolution, "_smart_record_battle"))
+        self.assertFalse(hasattr(_coevolution, "_record_battle"))
+        source = inspect.getsource(_coevolution.run_smart_coevolution)
+        self.assertNotIn("open(", source)
+        self.assertNotIn("battle_log_dir", source)
+
 
 class TestTacticalPlanner(unittest.TestCase):
     def setUp(self):
@@ -124,6 +176,95 @@ class TestTacticalPlanner(unittest.TestCase):
         self.assertIn((0, 4, 0), candidates)
         self.assertIn((0, 0, 4), candidates)
         self.assertTrue(all(sum(c) == 4 for c in candidates))
+
+    def test_optional_kernel_ranks_candidates_without_numba(self):
+        candidates = np.asarray([[4, 0, 0, -1], [0, 4, 0, -1],
+                                 [2, 0, 2, -1]], dtype=np.int64)
+        multipliers = np.ones((4, 4), dtype=np.float64)
+        order = rank_macro_candidates(
+            candidates, [6000], [2000], [0], 0, 6000, 2000, 1,
+            0, 0, 0, multipliers, top_k=2)
+        self.assertEqual(len(order), 2)
+        self.assertTrue(all(0 <= index < len(candidates) for index in order))
+        self.assertIsInstance(using_numba(), bool)
+
+    def test_numba_numeric_resolver_matches_reference_on_random_states(self):
+        rng = np.random.RandomState(20260722)
+        multipliers = np.asarray([
+            [1.0, 1.3, 1.0, 0.7],
+            [0.7, 1.0, 1.3, 1.0],
+            [1.0, 0.7, 1.0, 1.3],
+            [1.3, 1.0, 0.7, 1.0],
+        ])
+        for _ in range(2000):
+            hp = rng.randint(0, 6301, size=3)
+            hp[rng.randint(0, 3)] = max(100, hp[rng.randint(0, 3)])
+            active = int(rng.randint(0, 3))
+            target_active = int(rng.randint(0, 3))
+            state = {
+                "hp": hp,
+                "target_hp": rng.randint(0, 6301, size=3),
+                "atk": rng.choice([1900, 1950, 2000, 2050, 2100], size=3),
+                "target_atk": rng.choice([1900, 1950, 2000, 2050, 2100], size=3),
+                "types": rng.randint(0, 4, size=3),
+                "target_types": rng.randint(0, 4, size=3),
+                "active": active,
+                "target_active": target_active,
+                "stack": np.asarray([0, 1, 2], dtype=np.int64),
+                "target_stack": np.asarray([0, 1, 2], dtype=np.int64),
+                "alive_count": int(np.sum(hp > 0)),
+                "target_alive_count": 3,
+                "bonus": int(rng.randint(0, 5)),
+                "target_bonus": int(rng.randint(0, 5)),
+                "shields": int(rng.randint(0, 9)),
+                "target_shields": int(rng.randint(0, 9)),
+                "remaining": int(rng.randint(0, 9)),
+                "target_remaining": int(rng.randint(0, 9)),
+                "target_type": int(rng.randint(0, 4)),
+                "target_index": int(rng.randint(0, 3)),
+            }
+            if hp[state["active"]] <= 0:
+                state["active"] = int(np.flatnonzero(hp > 0)[0]) if np.any(hp > 0) else 0
+            state["alive_count"] = int(np.sum(state["hp"] > 0))
+            state["target_active"] = int(np.flatnonzero(state["target_hp"] > 0)[0])
+            state["target_alive_count"] = int(np.sum(state["target_hp"] > 0))
+            plan = np.asarray([
+                int(rng.randint(0, 9)), int(rng.randint(0, 9)),
+                int(rng.randint(0, 5)), int(rng.randint(-1, 3))
+            ], dtype=np.int64)
+            reference = resolve_numeric(state, plan, multipliers, compiled=False)
+            compiled = resolve_numeric(state, plan, multipliers, compiled=True)
+            for key in ("hp", "active", "stack", "alive_count", "bonus",
+                        "shields", "remaining", "damage", "blocked",
+                        "unblocked", "switched", "forced_switch", "valid"):
+                if isinstance(reference[key], np.ndarray):
+                    np.testing.assert_array_equal(reference[key], compiled[key])
+                else:
+                    self.assertEqual(reference[key], compiled[key], key)
+
+    def test_exact_bounds_prove_minimum_four_shields_at_eight_actions(self):
+        self.player.remaining_actions = 8
+        self.player.bonus_actions = 0
+        bounds = exact_tactical_bounds(self.player)
+        self.assertEqual(bounds, TacticalBounds(
+            budget=8, min_attack=0, max_attack=8,
+            min_defend=4, max_defend=8, min_bonus=0, max_bonus=4))
+        self.assertGreaterEqual(bounds.min_defend, 4)
+
+    def test_exact_exchange_facts_prove_four_attacks_cannot_hit_four_shields(self):
+        self.player.characters[0].char_type = CharType.B
+        self.opponent.characters[0].char_type = CharType.C
+        facts = guaranteed_exchange_facts(self.opponent, self.player, 4, 4)
+        self.assertTrue(facts["guaranteed_zero_damage"])
+        self.assertEqual(facts["unblocked_attacks"], 0)
+
+    def test_exact_exchange_facts_prove_lethal_without_overkill(self):
+        self.player.characters[0].char_type = CharType.B
+        self.opponent.characters[0].char_type = CharType.C
+        self.opponent.active_character.hp = 5200
+        facts = guaranteed_exchange_facts(self.player, self.opponent, 2, 0)
+        self.assertTrue(facts["guaranteed_lethal"])
+        self.assertEqual(facts["overkill_attacks"], 0)
 
     def test_current_shields_reduce_current_damage(self):
         self.opponent.active_character.hp = 12000
@@ -202,6 +343,42 @@ class TestTacticalPlanner(unittest.TestCase):
         self.assertEqual(sum(a.action_type == "bonus" for a in actions), 4)
         self.assertEqual(sum(a.action_type == "attack" for a in actions), 0)
         self.assertEqual(sum(a.action_type == "defend" for a in actions), 0)
+
+    def test_robust_planner_records_mode_and_alternatives(self):
+        self.opponent.active_character.hp = 100
+        actions = self.agent.choose_actions(self.player, self.opponent, 7, [], 1)
+        self.assertEqual(self.agent.last_decision_diagnostics["mode"], "FINISH")
+        self.assertIn("selected_plan", self.agent.last_decision_diagnostics)
+        self.assertTrue(self.agent.last_decision_diagnostics["alternatives"])
+        self.assertGreaterEqual(sum(a.action_type == "attack" for a in actions), 1)
+
+    def test_anti_burst_mode_uses_robust_search(self):
+        self.opponent.active_character.hp = 12000
+        self.player.characters.append(Character(CharType.A))
+        self.player.stack_order.append(1)
+        self.opponent.characters.append(Character(CharType.C))
+        self.opponent.stack_order.append(1)
+        self.agent.opp_model.est_bonus_bank = 2
+        self.agent.opp_model.consecutive_bonus = 2
+        self.agent.opp_model.burst_risk = 0.9
+        self.player.active_character.hp = 6000
+        actions = self.agent.choose_actions(self.player, self.opponent, 7, [], 1)
+        diagnostics = self.agent.last_decision_diagnostics
+        self.assertEqual(diagnostics["mode"], "ANTI_BURST")
+        self.assertEqual(diagnostics["search_depth"], 3)
+        self.assertLessEqual(len(actions), self.player.base_actions + 4)
+
+    def test_switch_is_represented_as_macro_candidate_with_cost(self):
+        from coevolution import MacroAction
+        self.player.characters.append(Character(CharType.C))
+        self.player.stack_order.append(1)
+        self.player.remaining_actions = 2
+        candidates = self.agent._macro_candidates(self.player)
+        switched = [candidate for candidate in candidates if candidate.switch_to == 1]
+        self.assertTrue(switched)
+        self.assertTrue(all(candidate.attacks + candidate.defends + candidate.bonuses <= 1
+                            for candidate in switched))
+        self.assertTrue(any(isinstance(candidate, MacroAction) for candidate in switched))
 
 
 class TestBattleLogIntegrity(unittest.TestCase):

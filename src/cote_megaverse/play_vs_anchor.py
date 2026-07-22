@@ -10,17 +10,19 @@ import argparse
 import random
 from datetime import datetime
 
-from .play_vs_champion import (
-    ANCHOR_PROFILES,
-    EMOJI,
-    HumanInputAI,
-    PlayerQuit,
-    AdaptiveAI,
-    CounterAI,
-    random_team,
-    run_game,
-    save_play_stats,
-)
+try:
+    from .play_vs_champion import (
+        ANCHOR_PROFILES, EMOJI, HumanInputAI, PlayerQuit, AdaptiveAI,
+        CounterAI, random_team, run_game, save_play_stats)
+except ImportError:
+    import os
+    import sys
+    _project_root = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+    if _project_root not in sys.path:
+        sys.path.insert(0, _project_root)
+    from src.cote_megaverse.play_vs_champion import (
+        ANCHOR_PROFILES, EMOJI, HumanInputAI, PlayerQuit, AdaptiveAI,
+        CounterAI, random_team, run_game, save_play_stats)
 
 
 def anchor_factories():
@@ -34,7 +36,10 @@ def anchor_factories():
 
 def _profile_agent(profile):
     # Import locally to keep this wrapper dependent on the existing module API.
-    from .parameterized_ai_v2 import WeightedRandomAIv2
+    try:
+        from .parameterized_ai_v2 import WeightedRandomAIv2
+    except ImportError:
+        from src.cote_megaverse.parameterized_ai_v2 import WeightedRandomAIv2
     return WeightedRandomAIv2(profile)
 
 

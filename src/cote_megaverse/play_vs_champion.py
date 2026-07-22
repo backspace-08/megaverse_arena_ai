@@ -2,20 +2,35 @@
 Play against the NeuralAgent champion!
 Clean version with proper turn-by-turn display.
 """
-import sys, os, random, json, itertools
+import sys, os, random, json, copy
 from datetime import datetime
 import numpy as np
-from .coevolution import NeuralAgent, SmartNeuralAgent
-from .parameterized_ai_v2 import (BattleEngineV2, BattleAction, Player, Character,
-                                 CharType, get_type_multiplier, random_team, make_character,
-                                 MAX_BONUS_ACTIONS, MAX_TOTAL_ACTIONS, ACTION_COST_SWITCH, BASE_HP, TURN_ACTIONS,
-                                 TurnLog, AIProfile, WeightedRandomAIv2, CounterAI, AdaptiveAI,
-                                 calculate_damage, round_damage)
+try:
+    from .coevolution import NeuralAgent, SmartNeuralAgent
+    from .parameterized_ai_v2 import (BattleEngineV2, BattleAction, Player, Character,
+                                     CharType, get_type_multiplier, random_team, make_character,
+                                     MAX_BONUS_ACTIONS, MAX_TOTAL_ACTIONS, ACTION_COST_SWITCH, BASE_HP, TURN_ACTIONS,
+                                     TurnLog, AIProfile, WeightedRandomAIv2, CounterAI, AdaptiveAI,
+                                     calculate_damage, round_damage)
+except ImportError:
+    # Also support `python src/cote_megaverse/play_vs_champion.py`.
+    _project_root = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+    if _project_root not in sys.path:
+        sys.path.insert(0, _project_root)
+    from src.cote_megaverse.coevolution import NeuralAgent, SmartNeuralAgent
+    from src.cote_megaverse.parameterized_ai_v2 import (
+        BattleEngineV2, BattleAction, Player, Character, CharType,
+        get_type_multiplier, random_team, make_character, MAX_BONUS_ACTIONS,
+        MAX_TOTAL_ACTIONS, ACTION_COST_SWITCH, BASE_HP, TURN_ACTIONS, TurnLog,
+        AIProfile, WeightedRandomAIv2, CounterAI, AdaptiveAI, calculate_damage,
+        round_damage)
 
 EMOJI = {CharType.A: "[A]", CharType.B: "[B]", CharType.C: "[C]", CharType.D: "[D]"}
 TYPE_NAMES = {CharType.A: "Artist", CharType.B: "Brawler", CharType.C: "Coordinator", CharType.D: "Defender"}
 _project_root = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 _artifacts_dir = os.path.join(_project_root, "artifacts")
+BATTLE_LOG_FILE = os.path.join(_artifacts_dir, "battle_logs.jsonl")
+STATS_FILE = os.path.join(_artifacts_dir, "play_stats.json")
 
 class PlayerQuit(Exception):
     pass
@@ -71,7 +86,10 @@ def load_champion():
     path = os.path.join(ai_dir, 'best_genome.npy')
     if os.path.exists(path):
         return _load_agent(np.load(path), "Champion")
-    from .coevolution import random_genome, random_smart_genome
+    try:
+        from .coevolution import random_genome, random_smart_genome
+    except ImportError:
+        from src.cote_megaverse.coevolution import random_genome, random_smart_genome
     print("best_genome.npy NOT FOUND -- using random agent!")
     return _load_agent(random_smart_genome(), "Random")
 
@@ -120,7 +138,8 @@ def describe_turn(log, player_label, prev_hp, cur_chars):
 # CUSTOM GAME LOOP
 # ============================================================
 
-def run_game(human, champion, team_human, team_ai, human_first=True):
+def run_game(human, champion, team_human, team_ai, human_first=True,
+             battle_log_path=BATTLE_LOG_FILE):
     """
     Manual game loop with full display control.
     Returns winner: 1=human, 2=AI, 0=draw
@@ -138,6 +157,33 @@ def run_game(human, champion, team_human, team_ai, human_first=True):
     turn_num = 1
     current_player = 1
     logs = []
+    battle_record = {
+        "schema_version": 2,
+        "record_type": "champion_user_battle",
+        "started_at": datetime.now().isoformat(timespec="seconds"),
+        "human_first": human_first,
+        "players": {
+            "human": {"name": getattr(human, "name", "Human"), "player_id": 1 if human_first else 2},
+            "champion": {"name": getattr(champion, "name", "Champion"), "player_id": 2 if human_first else 1},
+        },
+        "teams": {
+            "human": [t.value for t in team_human],
+            "champion": [t.value for t in team_ai],
+        },
+        "turns": [],
+    }
+
+    def finish_battle(winner):
+        """Write the complete record once, including draw/win outcome."""
+        battle_record["winner_player_id"] = winner
+        battle_record["winner"] = (
+            "draw" if winner == 0 else
+            "human" if (winner == 1 and human_first) or (winner == 2 and not human_first)
+            else "champion")
+        battle_record["turn_count"] = len(battle_record["turns"])
+        battle_record["finished_at"] = datetime.now().isoformat(timespec="seconds")
+        _append_battle_log(battle_log_path, battle_record)
+        return winner
     
     def setup_turn(player, tn):
         base = min(TURN_ACTIONS.get(tn, 4), MAX_TOTAL_ACTIONS)
@@ -223,12 +269,7 @@ def run_game(human, champion, team_human, team_ai, human_first=True):
             print(f"  {mark} {EMOJI.get(c.char_type,'?')}#{i+1} {TYPE_NAMES.get(c.char_type,'?'):8s} "
                   f"|{bar(c.hp, c.max_hp)}| {c.hp:4d} ATK:{c.atk} {dead}")
         
-        opp_next_tn = turn_n + 1
-        opp_base = min(TURN_ACTIONS.get(opp_next_tn, 4), MAX_TOTAL_ACTIONS)
-        opp_total = min(opp_base + opp_p.bonus_actions, MAX_TOTAL_ACTIONS)
-        opp_used = min(opp_p.bonus_actions, opp_total - opp_base)
-        opp_stored_after = opp_p.bonus_actions - opp_used
-        print(f"  Bonus: {'*' * opp_stored_after}{'.' * (MAX_BONUS_ACTIONS - opp_stored_after)}  (Actions next turn: {opp_base} + {opp_used})")
+        print(f"  Bonus: {'*' * opp_p.bonus_actions}{'.' * (MAX_BONUS_ACTIONS - opp_p.bonus_actions)}")
         
         # Matchup
         yt = my_p.active_character.char_type
@@ -246,8 +287,8 @@ def run_game(human, champion, team_human, team_ai, human_first=True):
         
         return my_p, opp_p
     
-    def show_turn_summary(player, opponent, log, label):
-        """Show resolved actions and the one-turn shield exchange."""
+    def show_turn_summary(player, opponent, log, label, base_actions, bonus_actions):
+        """Show only resolved actions, damage, blocks, and actual budget."""
         print()
         print("-" * 40)
         print(f"  {label} turn #{turn_num}")
@@ -259,36 +300,42 @@ def run_game(human, champion, team_human, team_ai, human_first=True):
         if log.switched:
             print(f"  {label} switched")
         
+        other_label = "Ai" if label == "You" else "You"
+        matchup = f"  {label} vs {other_label}"
         if atk_count > 0:
             unblocked = log.unblocked_attacks or 0
             blocked_count = log.blocked_shields
-            print(f"  {label}: {atk_count} attacks vs {log.opponent_shields} shields: "
-                  f"{blocked_count} blocked, {unblocked} hit, {total_dmg} dmg")
+            print(matchup)
+            if blocked_count == atk_count:
+                print("  BLOCK!")
+                print(f"  {atk_count} attacks vs {log.opponent_shields} shields")
+            else:
+                print(f"  {atk_count} attack{'s' if atk_count != 1 else ''} vs "
+                      f"{log.opponent_shields} shields, {total_dmg} dmg")
         elif log.defend_actions > 0 or log.bonus_actions > 0:
-            bonus_info = f" (gained {log.bonus_actions} bonus)" if log.bonus_actions > 0 else ""
-            print(f"  {label} did not attack{bonus_info}")
+            print(f"  {label} did not attack")
         
         if atk_count == 0 and log.defend_actions == 0 and log.bonus_actions == 0 and not log.switched:
             print(f"  {label} did nothing")
-
-        # The shield result is public after the turn resolves, even when no
-        # attacks occurred. It describes the target's shields consumed by
-        # this exchange, not a future action allocation.
-        shield_owner = "AI" if label == "You" else "You"
-        print(f"  {shield_owner} spent shields: {log.opponent_shields}")
+        if label == "Ai":
+            print(f"  Opponent actions: {base_actions} + {bonus_actions}")
     
     # === GAME LOOP ===
     setup_turn(p1, 1)
     
     while turn_num <= 100:
         if p1.has_lost():
-            return 2 if human_first else 1
+            return finish_battle(2 if human_first else 1)
         if p2.has_lost():
-            return 1 if human_first else 2
+            return finish_battle(1 if human_first else 2)
         
         current = p1 if current_player == 1 else p2
         other = p2 if current_player == 1 else p1
         ai = p1_ai if current_player == 1 else p2_ai
+        state_before = {
+            "player": _battle_player_state(current, turn_num + 2),
+            "opponent": _battle_player_state(other, turn_num + 1),
+        }
         
         # Show state before human turn
         if (human_first and current is p1) or (not human_first and current is p2):
@@ -302,7 +349,20 @@ def run_game(human, champion, team_human, team_ai, human_first=True):
             ai_active_history.append(-1)  # placeholder (human turn)
         
         # Get actions from AI
+        action_base = current.base_actions
+        action_bonus = max(0, current.remaining_actions - current.base_actions)
         actions = ai.choose_actions(current, other, turn_num, logs, current_player)
+        action_records = [_battle_action_record(action) for action in actions]
+        decision_diagnostics = copy.deepcopy(getattr(ai, "last_decision_diagnostics", {}))
+        switch_from = state_before["player"]["active_index"]
+        switch_to = current.active_char_index
+        if switch_from != switch_to:
+            action_records.insert(0, {
+                "type": "switch",
+                "from_index": switch_from,
+                "to_index": switch_to,
+                "cost": ACTION_COST_SWITCH,
+            })
         
         # Track AI active after choose_actions (in case it switched)
         if is_ai_turn:
@@ -314,18 +374,44 @@ def run_game(human, champion, team_human, team_ai, human_first=True):
         # Execute turn
         log = execute_turn(current, other, actions, current_player)
         log.turn_num = turn_num
+        _resolve_battle_action_records(action_records, log)
         logs.append(log)
+        battle_record["turns"].append({
+            "turn": turn_num,
+            "player_id": current_player,
+            "actor": "human" if current_player == (1 if human_first else 2) else "champion",
+            "actions": action_records,
+            "decision_diagnostics": decision_diagnostics if is_ai_turn else {},
+            "state_before": state_before,
+            "result": {
+                "attack_actions": log.attack_actions,
+                "defend_actions": log.defend_actions,
+                "bonus_actions": log.bonus_actions,
+                "switched": log.switched,
+                "unblocked_attacks": log.unblocked_attacks,
+                "blocked_shields": log.blocked_shields,
+                "shields_before_opponent": log.opponent_shields,
+                "damage": log.total_damage,
+                "switch_from": switch_from if switch_from != switch_to else None,
+                "switch_to": switch_to if switch_from != switch_to else None,
+                "forced_switch": bool(current.forced_switch_after_death),
+            },
+            "state_after": {
+                "player": _battle_player_state(current, turn_num + 2),
+                "opponent": _battle_player_state(other, turn_num + 1),
+            },
+        })
         
         # Show turn result before death check
         is_ai = (human_first and current is p2) or (not human_first and current is p1)
-        label = "AI" if is_ai else "You"
-        show_turn_summary(current, other, log, label)
+        label = "Ai" if is_ai else "You"
+        show_turn_summary(current, other, log, label, action_base, action_bonus)
         
         # Check for deaths — return WHICH player won (1=p1, 2=p2)
         if p1.has_lost():
-            return 2  # p1 lost → p2 won
+            return finish_battle(2)  # p1 lost -> p2 won
         if p2.has_lost():
-            return 1  # p2 lost → p1 won
+            return finish_battle(1)  # p2 lost -> p1 won
         
         # Next player
         current_player = 2 if current_player == 1 else 1
@@ -340,7 +426,7 @@ def run_game(human, champion, team_human, team_ai, human_first=True):
         next_p = p1 if current_player == 1 else p2
         setup_turn(next_p, turn_num)
     
-    return 0  # draw
+    return finish_battle(0)  # draw
 
 
 # ============================================================
@@ -399,20 +485,30 @@ class HumanInputAI:
     
     def choose_actions(self, player, opponent, turn_num, turn_logs, player_id):
         actions = []
-        yt = player.active_character.char_type
-        at = opponent.active_character.char_type
-        dmg = int(player.active_character.atk * get_type_multiplier(yt, at))
+
+        def matchup_preview(character):
+            """Describe the real damage and hits needed after selecting a character."""
+            multiplier = get_type_multiplier(
+                character.char_type, opponent.active_character.char_type)
+            damage = int(character.atk * multiplier)
+            target_hp = opponent.active_character.hp
+            hits = (target_hp + damage - 1) // max(damage, 1)
+            tag = "[OK]" if multiplier > 1.0 else ("[XX]" if multiplier < 1.0 else "--")
+            return multiplier, damage, hits, tag
+
+        _, dmg, _, _ = matchup_preview(player.active_character)
         
         actions_taken = 0
         while player.remaining_actions - actions_taken > 0:
             remaining = player.remaining_actions - actions_taken
             print(f"\n  Actions: {remaining} | Your bonus: {player.bonus_actions}/{MAX_BONUS_ACTIONS}")
-            cmd = input("  a=atk s=shield b=bonus sw=switch pass=skip > ").strip().lower()
+            cmd = input("  a=atk s=shield b=bonus sw=switch > ").strip().lower()
             
             if cmd == "q":
                 raise PlayerQuit()
-            if cmd in ("pass", ""):
-                break
+            if cmd == "":
+                print("  Choose an action: a, s, b, or sw")
+                continue
             
             if cmd == "a":
                 actions.append(BattleAction("attack", player.active_char_index, opponent.active_char_index))
@@ -443,29 +539,124 @@ class HumanInputAI:
                 for i in player.stack_order:
                     c = player.characters[i]
                     if c.is_alive() and i != player.active_char_index:
-                        adv_s = get_type_multiplier(c.char_type, opponent.active_character.char_type)
-                        tag = "[OK]" if adv_s > 1.0 else ("[XX]" if adv_s < 1.0 else "--")
+                        multiplier, target_dmg, hits, tag = matchup_preview(c)
                         print(f"    [{i+1}] {EMOJI.get(c.char_type,'?')} {TYPE_NAMES.get(c.char_type,'?')} "
-                              f"HP:{c.hp} {tag}")
+                              f"HP:{c.hp} {tag} x{multiplier} "
+                              f"dmg:{target_dmg}/hit hits:{hits}")
                 try:
                     ch = int(input("  Number (0=cancel): ").strip())
                     if 1 <= ch <= 3:
                         target = ch - 1
                         if player.switch_character(target):
                             print(f"  > Switched to {EMOJI.get(player.active_character.char_type,'?')}")
-                            yt = player.active_character.char_type
-                            dmg = int(player.active_character.atk * get_type_multiplier(yt, opponent.active_character.char_type))
+                            multiplier, dmg, hits, tag = matchup_preview(player.active_character)
+                            print(f"  > Matchup: x{multiplier} {tag}, "
+                                  f"Pot dmg: ~{dmg}, hits to defeat active: {hits}")
                         else:
                             print("  Switch failed!")
                 except ValueError:
                     print("  Cancel")
             else:
-                print("  a/s/b/sw/pass")
+                print("  Choose an action: a, s, b, or sw")
         
         return actions
 
 
-STATS_FILE = os.path.join(_artifacts_dir, 'play_stats.json')
+BATTLE_LOG_FILE = os.path.join(_artifacts_dir, 'battle_logs.jsonl')
+def _battle_player_state(player, next_turn_num=None):
+    """Return a compact, model-friendly snapshot of one player."""
+    state = {
+        "active_index": player.active_char_index,
+        "stack_order": list(player.stack_order),
+        "shields": player.shields,
+        "bonus_actions": player.bonus_actions,
+        "base_actions": player.base_actions,
+        "remaining_actions": player.remaining_actions,
+        "characters": [
+            {"index": i, "type": character.char_type.value,
+             "hp": character.hp, "max_hp": character.max_hp,
+             "atk": character.atk, "alive": character.is_alive()}
+            for i, character in enumerate(player.characters)
+        ],
+    }
+    if next_turn_num is not None:
+        next_base = min(TURN_ACTIONS.get(next_turn_num, MAX_TOTAL_ACTIONS), MAX_TOTAL_ACTIONS)
+        state["next_base_actions"] = next_base
+        state["next_total_actions"] = min(next_base + player.bonus_actions, MAX_TOTAL_ACTIONS)
+    return state
+
+
+def _battle_action_record(action):
+    """Serialize the decision without depending on dataclass internals."""
+    return {
+        "type": action.action_type,
+        "attacker_index": action.attacker_idx,
+        "target_index": action.target_idx,
+        "damage": action.damage,
+        "blocked": action.blocked,
+    }
+
+
+def _resolve_battle_action_records(action_records, log):
+    """Attach resolved exchange facts to serialized attack decisions.
+
+    The interactive engine resolves attacks as one aggregate exchange, so the
+    old logger left every action at damage=0.  Preserve the aggregate result
+    while distributing blocked status and rounded damage deterministically.
+    """
+    attacks = [item for item in action_records if item.get("type") == "attack"]
+    blocked = max(0, min(len(attacks), int(log.blocked_shields)))
+    unblocked = len(attacks) - blocked
+    for index, item in enumerate(attacks):
+        item["blocked"] = index < blocked
+        item["damage"] = 0
+    if unblocked and log.total_damage:
+        base, remainder = divmod(int(log.total_damage), unblocked)
+        damage_index = 0
+        for item in attacks:
+            if not item["blocked"]:
+                item["damage"] = base + (1 if damage_index < remainder else 0)
+                damage_index += 1
+
+
+def validate_battle_record(record):
+    """Return invariant violations; accept both schema 1 and schema 2 logs."""
+    errors = []
+    if not isinstance(record, dict):
+        return ["record is not an object"]
+    if record.get("schema_version") not in (1, 2):
+        errors.append("unsupported schema_version")
+    turns = record.get("turns")
+    if not isinstance(turns, list):
+        return errors + ["turns is not a list"]
+    for number, turn in enumerate(turns, 1):
+        if turn.get("turn") != number and turn.get("turn") != number * 2 - 1:
+            errors.append(f"turn {number}: unexpected turn number")
+        before = turn.get("state_before", {})
+        after = turn.get("state_after", {})
+        for label, state in (("before", before), ("after", after)):
+            for side in ("player", "opponent"):
+                snapshot = state.get(side, {})
+                chars = snapshot.get("characters", [])
+                active = snapshot.get("active_index")
+                if chars and active is not None and 0 <= active < len(chars):
+                    if not chars[active].get("alive", chars[active].get("hp", 0) > 0):
+                        errors.append(f"turn {number}: {label}.{side} active character is dead")
+        result = turn.get("result", {})
+        attacks = [a for a in turn.get("actions", []) if a.get("type") == "attack"]
+        if result.get("attack_actions") != len(attacks):
+            errors.append(f"turn {number}: attack count mismatch")
+    return errors
+
+
+def _append_battle_log(path, record):
+    """Append one complete battle as JSONL for replay/training pipelines."""
+    if not path:
+        return
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as stream:
+        stream.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
+        stream.write("\n")
 
 def play_vs_champion():
     """Play interactive games vs the evolved champion."""

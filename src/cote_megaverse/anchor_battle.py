@@ -1,6 +1,14 @@
 """Battle of the anchors: WeightedRandomAIv2 profiles + CounterAI."""
 import sys, os, itertools, numpy as np
-from .parameterized_ai_v2 import BattleEngineV2, WeightedRandomAIv2, CounterAI, AdaptiveAI, random_team, AIProfile
+try:
+    from .parameterized_ai_v2 import BattleEngineV2, WeightedRandomAIv2, CounterAI, AdaptiveAI, random_team, AIProfile
+except ImportError:
+    _project_root = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+    if _project_root not in sys.path:
+        sys.path.insert(0, _project_root)
+    from src.cote_megaverse.parameterized_ai_v2 import (
+        BattleEngineV2, WeightedRandomAIv2, CounterAI, AdaptiveAI, random_team,
+        AIProfile)
 from collections import defaultdict
 
 ANCHORS = [

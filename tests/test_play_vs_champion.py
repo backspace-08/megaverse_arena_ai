@@ -1,7 +1,7 @@
 """
 Tests for play_vs_champion.py (interactive game + benchmark).
 """
-import sys, os, json, io, unittest
+import sys, os, json, io, tempfile, unittest
 from contextlib import redirect_stdout
 from unittest.mock import patch, MagicMock
 import numpy as np
@@ -32,7 +32,7 @@ def _write_versions(versions, path):
 # ── Tests ────────────────────────────────────────────────────────
 
 class TestListVersions(unittest.TestCase):
-VERSIONS_PATH = os.path.join("artifacts", "versions.json")
+    VERSIONS_PATH = os.path.join("artifacts", "versions.json")
 
     def setUp(self):
         self._has_real = os.path.exists(self.VERSIONS_PATH)
@@ -256,6 +256,52 @@ class TestRunGame(unittest.TestCase):
         winner = run_game(human, self.agent_b, self.team_a, self.team_b, human_first=True)
         self.assertIn(winner, [0, 1, 2])
 
+    def test_battle_log_is_structured_jsonl(self):
+        """A completed game can be replayed or converted into training data."""
+        from play_vs_champion import run_game
+        from parameterized_ai_v2 import CharType
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = os.path.join(temp_dir, "battle.jsonl")
+            winner = run_game(
+                _ScriptedAI("attack", "Human"),
+                _ScriptedAI("defend", "Champion"),
+                [CharType.A, CharType.B, CharType.C],
+                [CharType.A, CharType.B, CharType.C],
+                human_first=True,
+                battle_log_path=log_path,
+            )
+            with open(log_path, encoding="utf-8") as stream:
+                record = json.loads(stream.readline())
+
+        self.assertEqual(record["schema_version"], 2)
+        self.assertEqual(record["record_type"], "champion_user_battle")
+        self.assertEqual(record["winner_player_id"], winner)
+        self.assertGreater(record["turn_count"], 0)
+        turn = record["turns"][0]
+        self.assertIn("state_before", turn)
+        self.assertIn("state_after", turn)
+        self.assertIn("actions", turn)
+        self.assertIn("damage", turn["result"])
+        self.assertTrue(all("damage" in action for action in turn["actions"]))
+
+    def test_battle_record_validator_accepts_v1_and_rejects_dead_active(self):
+        from play_vs_champion import validate_battle_record
+        valid_v1 = {"schema_version": 1, "turns": []}
+        self.assertEqual(validate_battle_record(valid_v1), [])
+        invalid = {
+            "schema_version": 2,
+            "turns": [{
+                "turn": 1,
+                "actions": [],
+                "result": {"attack_actions": 0},
+                "state_before": {"player": {"active_index": 0, "characters": [{"hp": 0, "alive": False}]}, "opponent": {}},
+                "state_after": {"player": {"active_index": 0, "characters": [{"hp": 0, "alive": False}]}, "opponent": {}},
+            }],
+        }
+        self.assertTrue(any("active character is dead" in error
+                            for error in validate_battle_record(invalid)))
+
     def test_game_symmetry(self):
         """P2-first game also completes."""
         from play_vs_champion import run_game
@@ -346,8 +392,8 @@ class TestRunGameMechanics(unittest.TestCase):
         self.assertTrue(any(t.blocked_shields > 0 for t in atk_logs),
                         "expected some attacks to be blocked by shields")
 
-    def test_shield_spent_result_is_reported_even_without_attacks(self):
-        """Resolved shield allocation is public, including a zero exchange."""
+    def test_resolved_turn_summary_is_compact(self):
+        """Turn summaries show resolved actions without shield bookkeeping noise."""
         from play_vs_champion import run_game
 
         output = io.StringIO()
@@ -357,11 +403,11 @@ class TestRunGameMechanics(unittest.TestCase):
                      self.team, self.team, human_first=True)
 
         text = output.getvalue()
-        self.assertIn("AI spent shields: 0", text)
-        self.assertIn("You spent shields: 0", text)
-        self.assertIn("AI spent shields: 2", text)
-        self.assertIn("You spent shields: 2", text)
-        self.assertNotIn("set shields for the opponent's next turn", text)
+        self.assertIn("You turn #1", text)
+        self.assertIn("You did not attack", text)
+        self.assertIn("Ai turn #2", text)
+        self.assertIn("Opponent actions:", text)
+        self.assertNotIn("spent shields", text)
 
     def test_bonus_banking_capped(self):
         """Bonus banker never exceeds MAX_BONUS_ACTIONS in run_game."""
@@ -428,7 +474,7 @@ class TestDescribeTurn(unittest.TestCase):
 
 
 class TestHumanInputAI(unittest.TestCase):
-    def test_pass(self):
+    def test_empty_enter_does_not_skip(self):
         from play_vs_champion import HumanInputAI
         from parameterized_ai_v2 import Player, Character, CharType
         c = Character(char_type=CharType.A)
@@ -437,9 +483,9 @@ class TestHumanInputAI(unittest.TestCase):
         opp = Player(player_id=1, characters=[Character(char_type=CharType.B)])
         opp.remaining_actions = 3
         ai = HumanInputAI()
-        with patch("builtins.input", return_value=""):
+        with patch("builtins.input", side_effect=["", "a", "a", "a"]):
             actions = ai.choose_actions(p, opp, 1, [], 0)
-        self.assertEqual(actions, [])
+        self.assertEqual([action.action_type for action in actions], ["attack", "attack", "attack"])
 
     def test_attack_command(self):
         from play_vs_champion import HumanInputAI
@@ -450,10 +496,10 @@ class TestHumanInputAI(unittest.TestCase):
         opp = Player(player_id=1, characters=[Character(char_type=CharType.B)])
         opp.remaining_actions = 3
         ai = HumanInputAI()
-        with patch("builtins.input", side_effect=["a", ""]):
+        with patch("builtins.input", side_effect=["a", "a", "a"]):
             actions = ai.choose_actions(p, opp, 1, [], 0)
-        self.assertEqual(len(actions), 1)
-        self.assertEqual(actions[0].action_type, "attack")
+        self.assertEqual(len(actions), 3)
+        self.assertTrue(all(action.action_type == "attack" for action in actions))
 
     def test_shield_command(self):
         from play_vs_champion import HumanInputAI
@@ -464,10 +510,9 @@ class TestHumanInputAI(unittest.TestCase):
         opp = Player(player_id=1, characters=[Character(char_type=CharType.B)])
         opp.remaining_actions = 3
         ai = HumanInputAI()
-        with patch("builtins.input", side_effect=["s", ""]):
+        with patch("builtins.input", side_effect=["s", "a", "a"]):
             actions = ai.choose_actions(p, opp, 1, [], 0)
-        self.assertEqual(len(actions), 1)
-        self.assertEqual(actions[0].action_type, "defend")
+        self.assertEqual([action.action_type for action in actions], ["defend", "attack", "attack"])
 
     def test_bonus_command(self):
         from play_vs_champion import HumanInputAI
@@ -479,10 +524,9 @@ class TestHumanInputAI(unittest.TestCase):
         opp = Player(player_id=1, characters=[Character(char_type=CharType.B)])
         opp.remaining_actions = 3
         ai = HumanInputAI()
-        with patch("builtins.input", side_effect=["b", ""]):
+        with patch("builtins.input", side_effect=["b", "a", "a", "a"]):
             actions = ai.choose_actions(p, opp, 1, [], 0)
-        self.assertEqual(len(actions), 1)
-        self.assertEqual(actions[0].action_type, "bonus")
+        self.assertEqual([action.action_type for action in actions], ["bonus", "attack", "attack"])
 
     def test_switch_command(self):
         from play_vs_champion import HumanInputAI
@@ -493,10 +537,10 @@ class TestHumanInputAI(unittest.TestCase):
         opp = Player(player_id=1, characters=[Character(char_type=CharType.C)])
         opp.remaining_actions = 3
         ai = HumanInputAI()
-        with patch("builtins.input", side_effect=["sw", "2", ""]):
+        with patch("builtins.input", side_effect=["sw", "2", "a", "a"]):
             actions = ai.choose_actions(p, opp, 1, [], 0)
         self.assertEqual(p.active_char_index, 1)
-        self.assertEqual(actions, [])
+        self.assertEqual([action.action_type for action in actions], ["attack", "attack"])
 
     def test_quit_raises(self):
         from play_vs_champion import HumanInputAI, PlayerQuit
@@ -522,9 +566,9 @@ class TestHumanInputAI(unittest.TestCase):
         opp = Player(player_id=1, characters=[Character(char_type=CharType.B)])
         opp.remaining_actions = 3
         ai = HumanInputAI()
-        with patch("builtins.input", side_effect=["b", ""]):
+        with patch("builtins.input", side_effect=["b", "a", "a", "a"]):
             actions = ai.choose_actions(p, opp, 1, [], 0)
-        self.assertEqual(actions, [])
+        self.assertEqual([action.action_type for action in actions], ["attack", "attack", "attack"])
 
     def test_unknown_command_ignored(self):
         """Garbage input shows help and doesn't consume actions."""
@@ -536,10 +580,10 @@ class TestHumanInputAI(unittest.TestCase):
         opp = Player(player_id=1, characters=[Character(char_type=CharType.B)])
         opp.remaining_actions = 3
         ai = HumanInputAI()
-        with patch("builtins.input", side_effect=["xyz", "a", ""]):
+        with patch("builtins.input", side_effect=["xyz", "a", "a", "a"]):
             actions = ai.choose_actions(p, opp, 1, [], 0)
-        self.assertEqual(len(actions), 1)
-        self.assertEqual(actions[0].action_type, "attack")
+        self.assertEqual(len(actions), 3)
+        self.assertTrue(all(action.action_type == "attack" for action in actions))
 
     def test_switch_already_switched(self):
         """Second switch in the same round is rejected."""
@@ -552,10 +596,10 @@ class TestHumanInputAI(unittest.TestCase):
         opp = Player(player_id=1, characters=[Character(char_type=CharType.C)])
         opp.remaining_actions = 3
         ai = HumanInputAI()
-        with patch("builtins.input", side_effect=["sw", ""]):
+        with patch("builtins.input", side_effect=["sw", "a", "a", "a"]):
             actions = ai.choose_actions(p, opp, 1, [], 0)
         self.assertEqual(p.active_char_index, 0)  # no switch happened
-        self.assertEqual(actions, [])
+        self.assertEqual([action.action_type for action in actions], ["attack", "attack", "attack"])
 
     def test_switch_cancel(self):
         """Choosing 0 in the switch menu cancels."""
@@ -567,10 +611,10 @@ class TestHumanInputAI(unittest.TestCase):
         opp = Player(player_id=1, characters=[Character(char_type=CharType.C)])
         opp.remaining_actions = 3
         ai = HumanInputAI()
-        with patch("builtins.input", side_effect=["sw", "0", ""]):
+        with patch("builtins.input", side_effect=["sw", "0", "a", "a", "a"]):
             actions = ai.choose_actions(p, opp, 1, [], 0)
         self.assertEqual(p.active_char_index, 0)
-        self.assertEqual(actions, [])
+        self.assertEqual([action.action_type for action in actions], ["attack", "attack", "attack"])
 
     def test_multiple_actions_queued(self):
         """Actions accumulate until the budget runs out."""

@@ -8,4 +8,4 @@ artifacts/
 # Training output and recorded battles
 parsing/
 docs/
-
+*.egg-info/
