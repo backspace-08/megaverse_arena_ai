@@ -327,6 +327,14 @@ them is where bluffing lives:
   some world permits a guaranteed loss, and lethal only if every world is
   lethal. Prefer a move that loses in no world over a move with a higher score
   that loses in one.
+- Worlds are joint `(shields, bank)` hypotheses, not shield marginals: the bank
+  sets the budget of the reply the planner must survive. The safety loss gate
+  must size the opponent's reply from the *believed* bank, never from the
+  resolver state with the bank masked to zero — masking would make every
+  banked burst invisible to the gate, which is the bank-and-burst hole.
+- The loss gate may special-case "only our active is our last living body": a
+  side with a spare body cannot be wiped by a single allocation, so the reply
+  test is a damage comparison, not a full reply enumeration.
 - When no more than three characters remain alive across both sides, planner
   extends search beyond normal depth to reduce endgame horizon errors.
 - Evaluation must account for material, living bodies, own bank, the believed
@@ -378,14 +386,22 @@ reasoning engine with one controlled source of randomness. It has four layers:
 1. **Belief** (`infoset.py::OpponentModel`). The only sanctioned source of
    opponent hidden state. It keeps a joint distribution over `(shields, bank)`
    candidates paid out of the same public remainder, updated by revealed
-   budgets, revealed shield counts, and attack exchanges. It never reads the
-   resolver's opponent fields.
+   budgets, revealed shield counts, and attack exchanges. The prior over legal
+   splits is **binomial**: each remainder action independently becomes a shield
+   with probability `defend_share`, so evidence moves the belief sharply (an
+   opponent repeatedly observed holding no shields is read as a banker). Attack
+   observations feed that behavioural prior; an `EPSILON` keeps every legal
+   world alive (splits are pruned only by hard public facts, never by
+   assumption). It never reads the resolver's opponent fields.
 
 2. **Gates** (hard, unconditional). Match-winning moves are taken first; moves
-   that permit a guaranteed immediate loss in any shield world are excluded
-   when a safe alternative exists; guaranteed-lethal-and-defense outranks a
-   bare lethal. Dominated switches (to a strictly weaker body) are never
-   sampled. These gates are checked before any scoring.
+   that permit a guaranteed immediate loss in any joint `(shields, bank)` world
+   are excluded when a safe alternative exists (`_reply_kills_us` sizes the
+   opponent's reply from the believed bank, and `loss_probability` prefers a
+   move that dies in no world over one that dies in a credible few);
+   guaranteed-lethal-and-defense outranks a bare lethal. Dominated switches (to
+   a strictly weaker body) are never sampled. These gates are checked before
+   any scoring.
 
 3. **Scoring** (heuristic, over the safe candidates). Material, living bodies,
    survival, tempo, switch value, burst setup, and four strategic terms:
@@ -500,8 +516,9 @@ Commands (all take `--run <name>` for per-session isolation):
 - `new --seed N [--temp T] [--ai_first|--human_first]` — start a game. The
   first mover is random by default.
 - `move --run <name> "a,d,b"[,sw]` — play your turn; the bot responds
-  automatically. `a/d/b` must sum to your budget; `sw` is a 1-based switch
-  target.
+  automatically. `a/d/b` need not sum to your budget: **the leftover is
+  auto-banked as bonuses** (specify intent, the rest banks). Only going over
+  budget errors. `sw` is a 1-based switch target among living characters.
 - `move --run <name> -` — advance the bot's turn when it moves first.
 - `view` / `end` — show the state / finish and record the result.
 - `session --games N` — play N games back-to-back, each recorded
@@ -545,6 +562,8 @@ these tests measure real strength against the same information a human sees.
 - `src/cote_megaverse/solve1v1.py`: exact 1v1 equilibrium solver (laboratory).
 - `src/cote_megaverse/cli.py`: position-analysis entry point.
 - `play.py`, `track_winrate.py`: harness and statistics (see above).
+- `run_baseline.py`: parallel benchmark runner (`--seeds --limit --workers`).
+- `run_exploit.py`: bot win rate vs the shield-reading "reader" policy.
 - `tests/test_new_engine.py`, `tests/test_layers.py`,
   `tests/test_interactive.py`: rules, fairness, strategy, benchmark, and
   terminal-visibility tests.
@@ -565,16 +584,21 @@ python -m py_compile src/cote_megaverse/rules.py src/cote_megaverse/agent.py src
 git diff --check
 ```
 
-Run a seeded AI-vs-human-policy baseline:
+Run a seeded AI-vs-human-policy baseline, in parallel on `N` cores:
 
 ```powershell
-python -c "from src.cote_megaverse.benchmark import benchmark_policies; print(benchmark_policies(seeds=range(100), depth=2, max_half_turns=100))"
+python run_baseline.py --seeds 100 --limit 100 --workers 16 --out after_bench.txt
 ```
 
-The benchmark policies are `random`, `greedy`, and `bonus_shield`. Every seed
-is played once with the human policy first and once with AI first. Do not
-interpret self-play win rate as human win rate. Record wins, losses, draws,
-missed guaranteed lethals, and guaranteed-loss moves separately.
+Do NOT run it through `python -c "..."`: on Windows multiprocessing uses spawn
+and needs a file-based `__main__`, so `python -c` cannot parallelize. The
+bundled policies are `random`, `greedy`, and `bonus_shield`; every seed is
+played once with the human policy first and once with AI first. `benchmark.py`
+also defines the exploit policies `reader` (predicts the bot's shields) and
+`burster` (bank-and-burst) — use them to verify a change actually closes the
+hole a strong human exploited. Do not interpret self-play win rate as human
+win rate. Record wins, losses, draws, missed guaranteed lethals, and
+guaranteed-loss moves separately.
 
 Evaluate against human-like play with the harness:
 
