@@ -1,5 +1,7 @@
 """Human-fair belief-aware planning agent."""
 
+import math
+
 from dataclasses import dataclass, field, replace
 
 from .infoset import OpponentModel
@@ -152,9 +154,20 @@ class TacticalOutcome:
 
 
 class Planner:
-    def __init__(self, depth=3, branch_limit=None):
+    def __init__(self, depth=3, branch_limit=None, temperature=0.0, rng=None,
+                 band_fraction=0.15):
         self.depth = depth
         self.branch_limit = branch_limit
+        # Context-conditional mixing. 0 -> fully deterministic argmax (fast,
+        # reproducible, strong, good for tests). > 0 -> the bot mixes ONLY at
+        # genuine decision points: when at least two moves score within
+        # `band_fraction` of the best, it samples among them with a softmax of
+        # width `temperature` (fraction of the best score). Everywhere else a
+        # clear leader exists and is played deterministically, so mixing never
+        # produces blunders and the bot keeps its positional strength.
+        self.temperature = temperature
+        self.band_fraction = band_fraction
+        self.rng = rng
         self.history = PublicHistory()
         self.model = OpponentModel()
         self.objective = Objective()
@@ -252,6 +265,41 @@ class Planner:
             all(allocation.attacks >= (attacks_to_kill(character, target, shields) or MAX_ACTIONS + 1)
                  for shields in belief.probabilities), expected)
 
+    def _burst_setup_value(self, state, move, belief, attacker_idx):
+        """Value of banking `move.bonuses` now to kill on the bot's next turn.
+
+        A concentrated burst is worth more than trickling damage into shields:
+        it lands a lethal blow before the opponent can answer. Reward banking
+        only when the resulting next-turn burst actually kills the active
+        target against the believed shield worlds; otherwise it is just
+        deferred damage and gets no bonus (avoid over-banking).
+        """
+        bank_after = move.bonuses
+        if bank_after <= 0:
+            return 0.0
+        me, enemy = state.player, state.opponent
+        attacker = me.characters[attacker_idx]
+        target = enemy.active_character
+        # Banking must not sacrifice survival. The opponent acts at turn+1 and
+        # may kill the active character before the burst lands at turn+2. If the
+        # worst-case incoming damage over the opponent's hidden bank kills the
+        # active character, the burst never happens: return 0 (no reward).
+        if attacker_idx == me.active:
+            opp_turn = state.turn + 1
+            worst_bank = max(self.model.bank_distribution().keys(), default=0)
+            opp_budget = min(MAX_ACTIONS, base_budget(opp_turn) + worst_bank)
+            incoming = exchange_damage(enemy.active_character, attacker,
+                                       max(0, opp_budget - move.defends))
+            if incoming >= attacker.hp:
+                return 0.0
+        my_next_turn = state.turn + 2
+        next_budget = min(MAX_ACTIONS, base_budget(my_next_turn) + bank_after)
+        for shields, _p in belief.probabilities.items():
+            landed = max(0, next_budget - shields)
+            if exchange_damage(attacker, target, landed) >= target.hp:
+                return 5000.0 * bank_after
+        return 0.0
+
     def tactical_outcome(self, state: GameState, move: Allocation,
                          belief: ShieldBelief, facts: TacticalFacts):
         """Evaluate hard tactical facts across every live shield world.
@@ -319,6 +367,16 @@ class Planner:
             opponent_bank=credible_bank,
         )
         switch_by_target = {value.target: value for value in switch_values}
+
+        # ---- Strategic layer signals -----------------------------------
+        # (a) Punish banking: if the opponent is likely exposed (few shields)
+        #     and is banking toward a burst, they are a sitting target RIGHT
+        #     NOW. Pressure instead of mirroring their passivity.
+        opponent_exposed = belief.probabilities.get(0, 0.0) >= 0.6
+        opponent_banking = credible_bank >= 2
+        # (b) All-in / threat when losing: if we are behind in bodies, a pure
+        #     survival turtle just delays a loss. Prefer threat over shields.
+        behind = (state.player.alive_count < state.opponent.alive_count)
         scored = []
         for move, facts in candidate_facts:
             continuations = []
@@ -340,9 +398,11 @@ class Planner:
             switch_score = switch.value * 0.8 if switch else 0.0
             objective_score = self._objective_score(
                 move, facts, survival, state.player.active_character.hp)
+            attacker_idx = move.switch_to if move.switch else state.player.active
+            burst_setup = self._burst_setup_value(state, move, belief, attacker_idx)
             score = continuation + facts.expected_damage * 0.6
             score += facts.lethal_probability * 5000 + future_bonus
-            score += survival * 0.25 + switch_score + objective_score
+            score += survival * 0.25 + switch_score + objective_score + burst_setup
             known_unshielded = belief.probabilities == {0: 1.0}
             if self.history.attack_rate >= 0.65 and known_unshielded:
                 score += facts.expected_damage * 0.9 + move.attacks * 250
@@ -354,6 +414,19 @@ class Planner:
                 score -= 2200
             if self.passive_streak >= 2 and move.attacks == 0:
                 score -= 4000 + self.passive_streak * 1000
+            # Strategic layer adjustments.
+            punish = 0.0
+            if opponent_exposed and opponent_banking and move.attacks:
+                punish = facts.expected_damage * 0.7 + move.attacks * 300
+            desperation = 0.0
+            if behind:
+                if move.attacks:
+                    desperation = facts.expected_damage * 0.4 + move.attacks * 150
+                elif move.bonuses:
+                    desperation = move.bonuses * 250.0      # set up a burst
+                if move.attacks == 0 and move.defends > 0 and move.bonuses == 0:
+                    desperation -= move.defends * 400.0      # pure turtle
+            score += punish + desperation
             components = {
                 "continuation": continuation,
                 "expected_damage": facts.expected_damage * 0.6,
@@ -362,6 +435,9 @@ class Planner:
                 "survival": survival * 0.25,
                 "switch_value": switch_score,
                 "objective": objective_score,
+                "burst_setup": burst_setup,
+                "punish_banking": punish,
+                "desperation": desperation,
                 "expected_incoming": incoming,
                 "passive_streak": self.passive_streak,
             }
@@ -389,7 +465,43 @@ class Planner:
             item[4].lethal_probability,
             item[0],
         ), reverse=True)
-        score, move, facts, components, outcome = scored[0]
+        if self.temperature > 0 and self.rng is not None:
+            # Mix only at genuine decision points: a tight value band around
+            # the best move, and only when at least two moves are inside it.
+            # A clear leader is played deterministically; dominated switches
+            # are never sampled (only reasoned).
+            def _dominated(item):
+                """A switch to a strictly weaker body wins nothing, even in
+                theory: the same allocation without the switch is strictly
+                better. Such switches must never be sampled, only reasoned."""
+                if not item[1].switch:
+                    return False
+                sv = switch_by_target.get(item[1].switch_to)
+                return sv is not None and sv.value < 0
+
+            candidates = [item for item in scored
+                          if item[0] >= 0 and not _dominated(item)] or scored
+            top = max(item[0] for item in candidates)
+            band = self.band_fraction * (top if top > 0 else 1.0)
+            tie_set = [item for item in candidates if item[0] >= top - band]
+            if len(tie_set) >= 2:
+                tie_scores = [item[0] for item in tie_set]
+                temp = self.temperature * (top if top > 0 else 1.0)
+                weights = [math.exp((s - top) / temp) for s in tie_scores]
+                total = sum(weights)
+                pick = self.rng.random() * total
+                acc = 0.0
+                idx = len(tie_set) - 1
+                for i, w in enumerate(weights):
+                    acc += w
+                    if pick <= acc:
+                        idx = i
+                        break
+                score, move, facts, components, outcome = tie_set[idx]
+            else:
+                score, move, facts, components, outcome = scored[0]
+        else:
+            score, move, facts, components, outcome = scored[0]
         second_score = scored[1][0] if len(scored) > 1 else score
         self.last_report = {
             "objective": self.objective.name,

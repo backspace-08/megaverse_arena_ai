@@ -8,7 +8,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), "src
 
 from cote_megaverse.agent import Planner
 from cote_megaverse.rules import (ATK_POOL, HP_POOL, Allocation, Character,
-                                   GameState, Side, Type,
+                                   GameState, Side, Type, apply,
                                    attacks_to_kill, exchange_damage, initial,
                                    legal_allocations)
 
@@ -41,6 +41,28 @@ class NewEngineTests(unittest.TestCase):
         state = initial((Type.A, Type.B, Type.C), (Type.B, Type.C, Type.D))
         self.assertEqual(state.player.actions, 1)
         self.assertEqual(len(legal_allocations(state.player)), 5)
+
+    def test_forced_promotion_uses_target_order_and_clean_stack(self):
+        # When the active character dies, the next living character comes from
+        # the TARGET's own stack order (never the actor's), and the rebuilt
+        # stack has no duplicates and no dead entries.
+        def ch(t, hp, atk):
+            return Character(t, hp, atk, hp)
+
+        actor = Side((ch(Type.B, 800, 2100), ch(Type.A, 6000, 1900),
+                      ch(Type.C, 400, 2000)),
+                     active=2, stack_order=(2, 0, 1), actions=4)
+        target = Side((ch(Type.A, 1, 2000), ch(Type.D, 6000, 2100),
+                       ch(Type.D, 6300, 1900)),
+                      active=0, stack_order=(0, 1, 2))
+        state = GameState(actor, target, turn=7, player_to_move=True)
+        after = apply(state, Allocation(4, 0, 0, None))
+        t = after.opponent
+        self.assertEqual(t.active, 1)                 # target's own order -> D#1
+        self.assertEqual(t.stack_order, (1, 2))        # clean, promoted first
+        self.assertEqual(len(t.stack_order), len(set(t.stack_order)))  # no dupes
+        self.assertTrue(all(t.characters[i].alive for i in t.stack_order))
+        self.assertTrue(t.forced_promotion)
 
     def test_forced_promotion_is_not_voluntary_switch(self):
         state = initial((Type.A, Type.B, Type.C), (Type.B, Type.C, Type.D))

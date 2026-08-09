@@ -44,8 +44,37 @@ def choose_human_policy(state: GameState, policy: str, rng: random.Random):
     return max(moves, key=score)
 
 
+def reader_human_move(state: GameState, planner: Planner,
+                      rng: random.Random):
+    """Human 'reader' that predicts the bot's next shields to exploit it.
+
+    It runs the bot's own planner forward to anticipate the bot's defensive
+    shields, then commits attacks/defends knowing those shields. A deterministic
+    bot (temp=0) is predicted exactly and exploited; a mixed bot (temp>0) is
+    only predicted as a draw from its distribution, so the reader misfires a
+    share of the time. The win-rate gap between the two is the measurable value
+    of mixing. (planner.choose is read-only on history/model.)
+    """
+    moves = legal_allocations(state.player)
+    bot_view = state.__class__(state.opponent, state.player, state.turn, True)
+    pred = planner.choose(bot_view)
+    pred_shields = pred.defends
+    target = state.opponent.active_character
+
+    def score(move):
+        attacker = (state.player.active_character if not move.switch
+                    else state.player.characters[move.switch_to])
+        landed = max(0, move.attacks - pred_shields)
+        dmg = exchange_damage(attacker, target, landed)
+        lethal = int(dmg >= target.hp)
+        return (lethal * 100000 + dmg * 10 + move.defends * 700
+                + move.bonuses * 150)
+
+    return max(moves, key=score)
+
+
 def run_match(seed=0, policy="greedy", depth=2, max_half_turns=100,
-              ai_starts=False):
+              ai_starts=False, temperature=0.0):
     """Run one AI-vs-human-policy match with public-information updates."""
     rng = random.Random(seed)
     types = list(Type)
@@ -53,7 +82,8 @@ def run_match(seed=0, policy="greedy", depth=2, max_half_turns=100,
                     tuple(rng.choice(types) for _ in range(3)), rng=rng)
     if ai_starts:
         state = replace(state, player_to_move=False).prepare()
-    planner = Planner(depth=depth)
+    bot_rng = random.Random(seed * 1000003 + 7)
+    planner = Planner(depth=depth, temperature=temperature, rng=bot_rng)
     metrics = {"missed_guaranteed_lethal": 0, "guaranteed_loss_moves": 0,
                "ai_turns": 0, "human_turns": 0, "hit_turn_limit": False}
     replay = []
@@ -70,7 +100,10 @@ def run_match(seed=0, policy="greedy", depth=2, max_half_turns=100,
             # observe_shields when the AI attacks and the human's shields
             # are publicly consumed.
             before = state
-            move = choose_human_policy(state, policy, rng)
+            if policy == "reader":
+                move = reader_human_move(state, planner, rng)
+            else:
+                move = choose_human_policy(state, policy, rng)
             metrics["human_turns"] += 1
             planner.observe(move.attacks, move.bonuses, move.switch,
                             budget=before.player.actions)
@@ -117,12 +150,14 @@ def _seat_stats(matches):
     }
 
 
-def benchmark_policies(seeds=range(20), depth=2, max_half_turns=100):
+def benchmark_policies(seeds=range(20), depth=2, max_half_turns=100,
+                       temperature=0.0):
     """Compare the planner against each bundled human-like policy."""
     result = {}
     for policy in ("random", "greedy", "bonus_shield"):
         matches = [
-            run_match(seed, policy, depth, max_half_turns, ai_starts=ai_starts)
+            run_match(seed, policy, depth, max_half_turns, ai_starts=ai_starts,
+                      temperature=temperature)
             for seed in seeds for ai_starts in (False, True)
         ]
         ai_first_matches = [m for m in matches if m["ai_starts"]]

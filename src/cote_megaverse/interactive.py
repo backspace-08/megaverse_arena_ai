@@ -148,7 +148,10 @@ def show_resolution(before, move, after, label):
     attacker = before.player if before.player_to_move else before.opponent
     blocked = min(move.attacks, defender.shields)
     landed = max(0, move.attacks - blocked)
-    attacker_character = attacker.active_character
+    # If the move included a switch, the attacks come from the switched-to
+    # character, not the pre-switch active. Report the real attacker.
+    attacker_character = (attacker.characters[move.switch_to]
+                          if move.switch else attacker.active_character)
     target = defender.active_character
     damage = min(target.hp, exchange_damage(attacker_character, target, landed))
     print("\n" + "-" * 40)

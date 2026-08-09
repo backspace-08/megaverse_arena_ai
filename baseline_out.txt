@@ -1,0 +1,5 @@
+temperature=0.3 seeds=12 depth=2 elapsed=1612s
+policy         ai_first         human_first      combined       missed_lethal
+random         W11 L1 D0        W9 L3 D0         W20 L4 D0      0
+greedy         W11 L0 D1        W9 L0 D3         W20 L0 D4      0
+bonus_shield   W11 L0 D1        W9 L0 D3         W20 L0 D4      0

@@ -180,15 +180,25 @@ def apply(state: GameState, allocation: Allocation) -> GameState:
     target_active = target.active
     forced = target.forced_promotion
     if not characters[target_active].alive:
-        alive = [i for i in order if characters[i].alive]
-        target_active = alive[0] if alive else target_active
+        # Promote the next living character from the TARGET's own stack order,
+        # never from the actor's. Filter out the dead active and any dead or
+        # duplicated entries, preserving relative order, and rebuild a clean
+        # stack with the promoted character first.
+        seen = set()
+        living = []
+        for i in target.normalized_order():
+            if i != target.active and i not in seen and characters[i].alive:
+                seen.add(i)
+                living.append(i)
         forced = True
-        target_order = list(target.normalized_order())
-        target_order.remove(target_active)
-        target_order.insert(0, target_active)
-        target_order.insert(1, target.active)
+        if living:
+            target_active = living[0]
+            target_order = (target_active,) + tuple(i for i in living[1:])
+        else:
+            target_active = target.active
+            target_order = tuple(target.normalized_order())
     else:
-        target_order = list(target.normalized_order())
+        target_order = tuple(target.normalized_order())
     new_actor = replace(actor, active=active, stack_order=tuple(order), bonus=min(MAX_BONUS, actor.bonus + allocation.bonuses),
                         shields=allocation.defends, actions=0,
                         voluntary_switch_used=switch_used)
