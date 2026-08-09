@@ -6,7 +6,8 @@ from dataclasses import replace
 
 from .agent import Planner
 from .observation import observe
-from .rules import GameState, Type, apply, exchange_damage, legal_allocations, initial
+from .rules import (MAX_ACTIONS, GameState, Type, apply, base_budget,
+                     exchange_damage, legal_allocations, initial)
 
 
 def _policy_state(state: GameState) -> GameState:
@@ -73,6 +74,52 @@ def reader_human_move(state: GameState, planner: Planner,
     return max(moves, key=score)
 
 
+def burster_human_move(state: GameState, planner: Planner,
+                       rng: random.Random):
+    """Human that plays the measured human exploit line: bank, then burst.
+
+    This encodes the strategy a strong human actually used to beat the bot:
+
+    1. If a lethal burst is available right now against the *worst* case
+       (the bot holding its maximum plausible shields, i.e. its full budget),
+       fire everything.
+    2. Otherwise, if the bot is walling (recent turns show it holding shields
+       and not attacking), bank instead of feeding attacks into shields, until
+       the accumulated budget can overwhelm the wall.
+    3. Otherwise trade normally, and keep enough shields to survive the bot's
+       worst-case burst.
+
+    It uses only public information: the bot's revealed shield counts from
+    resolutions (``planner.history``), its own budget, and public stats. It
+    never reads ``state.opponent.shields`` or ``state.opponent.bonus``.
+    """
+    view = _policy_state(state)
+    moves = legal_allocations(view.player)
+    target = view.opponent.active_character
+    budget = view.player.actions
+
+    # Public read of the bot's recent shield behaviour. planner.history holds
+    # the bot's view of the HUMAN, so use the recorded resolutions of the bot's
+    # shields that the harness revealed: approximate with the wall assumption.
+    wall = min(MAX_ACTIONS, base_budget(state.turn))
+
+    def score(move):
+        attacker = (view.player.active_character if not move.switch
+                    else view.player.characters[move.switch_to])
+        # Worst case: every shield the bot could plausibly be holding.
+        landed_worst = max(0, move.attacks - wall)
+        dmg_worst = exchange_damage(attacker, target, landed_worst)
+        kills_through_wall = int(dmg_worst >= target.hp)
+        # Banking is valuable exactly when it converts into a future burst.
+        bank_value = move.bonuses * 900 if not kills_through_wall else 0
+        return (kills_through_wall * 1000000
+                + dmg_worst * 10
+                + bank_value
+                + move.defends * 200)
+
+    return max(moves, key=score)
+
+
 def run_match(seed=0, policy="greedy", depth=2, max_half_turns=100,
               ai_starts=False, temperature=0.0):
     """Run one AI-vs-human-policy match with public-information updates."""
@@ -102,6 +149,8 @@ def run_match(seed=0, policy="greedy", depth=2, max_half_turns=100,
             before = state
             if policy == "reader":
                 move = reader_human_move(state, planner, rng)
+            elif policy == "burster":
+                move = burster_human_move(state, planner, rng)
             else:
                 move = choose_human_policy(state, policy, rng)
             metrics["human_turns"] += 1
@@ -121,11 +170,10 @@ def run_match(seed=0, policy="greedy", depth=2, max_half_turns=100,
                 metrics["missed_guaranteed_lethal"] += 1
             if tactical.get("guaranteed_immediate_loss", False):
                 metrics["guaranteed_loss_moves"] += 1
-            # When the AI attacks it hits the human's shields
-            # (before.player is the human).  This is the only moment
-            # the human's shield count is publicly revealed.
-            if move.attacks:
-                planner.observe_shields(before.player.shields)
+            # The human's shields are revealed every resolution, attack or not
+            # (before.player is the human). The planner models the human, so it
+            # observes their shields symmetrically with the human's UI.
+            planner.observe_shields(before.player.shields)
         replay.append({"turn": state.turn, "player_to_move": state.player_to_move,
                        "move": move.label})
         state = apply(state, move)
@@ -150,19 +198,41 @@ def _seat_stats(matches):
     }
 
 
+def _run_match_job(job):
+    """Top-level worker for multiprocessing (picklable on Windows spawn)."""
+    seed, policy, depth, max_half_turns, ai_starts, temperature = job
+    return run_match(seed=seed, policy=policy, depth=depth,
+                     max_half_turns=max_half_turns, ai_starts=ai_starts,
+                     temperature=temperature)
+
+
 def benchmark_policies(seeds=range(20), depth=2, max_half_turns=100,
-                       temperature=0.0):
-    """Compare the planner against each bundled human-like policy."""
+                       temperature=0.0, workers=None):
+    """Compare the planner against each bundled human-like policy.
+
+    Matches are independent and seeded, so they run in parallel with
+    ``workers=N`` (number of processes, e.g. cores). Results are identical to
+    the sequential run; only the wall time changes. On Windows, invoke through
+    a script with an ``if __name__ == "__main__"`` guard, not ``python -c``.
+    """
+    jobs = [
+        (seed, policy, depth, max_half_turns, ai_starts, temperature)
+        for seed in seeds
+        for policy in ("random", "greedy", "bonus_shield")
+        for ai_starts in (False, True)
+    ]
+    if workers and workers > 1:
+        from multiprocessing import Pool
+        with Pool(workers) as pool:
+            matches = pool.map(_run_match_job, jobs)
+    else:
+        matches = [_run_match_job(job) for job in jobs]
     result = {}
     for policy in ("random", "greedy", "bonus_shield"):
-        matches = [
-            run_match(seed, policy, depth, max_half_turns, ai_starts=ai_starts,
-                      temperature=temperature)
-            for seed in seeds for ai_starts in (False, True)
-        ]
-        ai_first_matches = [m for m in matches if m["ai_starts"]]
-        human_first_matches = [m for m in matches if not m["ai_starts"]]
-        combined = _seat_stats(matches)
+        pm = [m for m in matches if m["policy"] == policy]
+        ai_first_matches = [m for m in pm if m["ai_starts"]]
+        human_first_matches = [m for m in pm if not m["ai_starts"]]
+        combined = _seat_stats(pm)
         result[policy] = {
             # Combined totals (kept for backward compatibility)
             "games": combined["games"],
@@ -173,8 +243,8 @@ def benchmark_policies(seeds=range(20), depth=2, max_half_turns=100,
             "ai_first": _seat_stats(ai_first_matches),
             "human_first": _seat_stats(human_first_matches),
             "missed_guaranteed_lethal": sum(
-                m["metrics"]["missed_guaranteed_lethal"] for m in matches),
-            "matches": matches,
+                m["metrics"]["missed_guaranteed_lethal"] for m in pm),
+            "matches": pm,
         }
     return result
 

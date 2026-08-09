@@ -33,18 +33,36 @@ from cote_megaverse.interactive import (PlayerQuit, human_allocation,
 from cote_megaverse.rules import (Allocation, GameState, MAX_BONUS, Type,
                                   apply, base_budget, exchange_damage, initial)
 
-STATE = os.path.join(os.path.dirname(__file__), "play_state.pkl")
-SESSION_LOG = os.path.join(os.path.dirname(__file__), "session_log.json")
-WINRATE_LOG = os.path.join(os.path.dirname(__file__), "winrate_log.json")
+_BASE = os.path.dirname(os.path.abspath(__file__))
+RUN = "default"
+
+
+def _set_run(name):
+    """Select the per-run sandbox; everything (state + logs) lives in runs/<name>/."""
+    global RUN
+    RUN = name
+    os.makedirs(os.path.join(_BASE, "runs", name), exist_ok=True)
+
+
+def _state_path():
+    return os.path.join(_BASE, "runs", RUN, "state.pkl")
+
+
+def _session_log_path():
+    return os.path.join(_BASE, "runs", RUN, "session_log.json")
+
+
+def _winrate_log_path():
+    return os.path.join(_BASE, "runs", RUN, "winrate_log.json")
 
 
 def save(game):
-    with open(STATE, "wb") as fh:
+    with open(_state_path(), "wb") as fh:
         pickle.dump(game, fh)
 
 
 def load():
-    with open(STATE, "rb") as fh:
+    with open(_state_path(), "rb") as fh:
         return pickle.load(fh)
 
 
@@ -60,7 +78,7 @@ def _write_json(path, data):
         json.dump(data, fh, ensure_ascii=False, indent=1)
 
 
-def render(state, game_index=None, session_total=None):
+def render(state, game_index=None, session_total=None, history=None):
     lines = []
     banner = ""
     if game_index and session_total:
@@ -78,8 +96,18 @@ def render(state, game_index=None, session_total=None):
         # public info only
         if tag == "YOU":
             lines.append(f"   your shields: {side.shields}")
-        lines.append(f"   action budget: {side.actions} "
-                     f"(base {base_budget(state.turn)})")
+        # Public budget breakdown for the ACTING side only: base actions (from
+        # turn) + banked bonus revealed on its own turn.
+        acting = state.player if state.player_to_move else state.opponent
+        if side is acting:
+            base = base_budget(state.turn)
+            bonus_actions = max(0, side.actions - base)
+            lines.append(f"   Actions: {base} + {bonus_actions}  "
+                         f"(total {side.actions})")
+    if history:
+        lines.append("  -- history (public) --")
+        for h in history[-10:]:
+            lines.append(f"    {h}")
     return "\n".join(lines)
 
 
@@ -102,7 +130,8 @@ def make_game(seed, depth, temp, game_index=None, force_ai_first=None,
     bot_rng = random.Random(seed * 1000003 + 17)
     planner = Planner(depth=depth, temperature=temp, rng=bot_rng)
     return {"state": state, "planner": planner, "seed": seed,
-            "ai_starts": ai_starts, "log": [], "game_index": game_index}
+            "ai_starts": ai_starts, "log": [], "history": [],
+            "game_index": game_index}
 
 
 def record_result(game, winner):
@@ -115,13 +144,13 @@ def record_result(game, winner):
         "winner": winner,
         "plies": len(game.get("log", [])),
     }
-    sess = _read_json(SESSION_LOG, [])
+    sess = _read_json(_session_log_path(), [])
     sess.append(entry)
-    _write_json(SESSION_LOG, sess)
-    wr = _read_json(WINRATE_LOG, [])
+    _write_json(_session_log_path(), sess)
+    wr = _read_json(_winrate_log_path(), [])
     wr.append({"seat": entry["seat"],
                "result": {"YOU": "w", "BOT": "l", "DRAW": "d"}[winner]})
-    _write_json(WINRATE_LOG, wr)
+    _write_json(_winrate_log_path(), wr)
 
 
 def _winner_of(game):
@@ -150,8 +179,8 @@ def _finish_game_if_needed(game):
     if done >= total:
         print("SESSION COMPLETE — all games recorded. Run:")
         print("  python track_winrate.py show")
-        if os.path.exists(STATE):
-            os.remove(STATE)
+        if os.path.exists(_state_path()):
+            os.remove(_state_path())
         return
     nxt = make_game(sess["start_seed"] + done, sess["depth"], sess["temp"],
                     game_index=done + 1)
@@ -236,23 +265,45 @@ def cmd_move(args):
     while not state.player_to_move:
         if state.player.lost or state.opponent.lost:
             break
-        state = run_bot(state, planner)
+        state = run_bot(state, planner, history=game.get("history"))
         game["state"] = state
     if state.player_to_move and args.move and args.move != "-":
         parts = [int(x) for x in args.move.split(",")]
-        a, d, b = parts[0], parts[1], parts[2]
-        sw = parts[3] if len(parts) > 3 else None
+        a = parts[0] if len(parts) > 0 else 0
+        d = parts[1] if len(parts) > 1 else 0
+        b = parts[2] if len(parts) > 2 else 0
+        # The CLI switch target is 1-based (matching interactive.py and the
+        # docs); Allocation.switch_to is 0-based.
+        sw = (parts[3] - 1) if len(parts) > 3 else None
+        # Budget ergonomics: you specify intent, the leftover is auto-banked.
+        # No need to sum attacks+defends+bonuses exactly to the budget.
+        budget = state.player.actions
+        used = a + d + b + (1 if sw is not None else 0)
+        if used > budget:
+            raise SystemExit(f"budget exceeded: {used} > {budget}")
+        b += budget - used
         move = human_move(state, a, d, b, sw)
         before = state
         state = apply(state, move)
         planner.observe(move.attacks, move.bonuses, move.switch,
                         budget=before.player.actions)
+        # The opponent's shields are revealed on EVERY resolution, regardless
+        # of whether we attacked: if they wasted shields, we see that waste.
         if move.attacks:
-            # human attacked -> bot's shields are revealed to the human
+            blocked = min(move.attacks, before.opponent.shields)
+            landed = move.attacks - blocked
+            dmg = exchange_damage(before.player.active_character
+                                  if not move.switch else before.player.characters[move.switch_to],
+                                  before.opponent.active_character, landed)
             print(f"[YOU] {move.label}  (bot held {before.opponent.shields} shields)")
+            hist = (f"T{before.turn} YOU: a{move.attacks} -> {dmg} dmg "
+                    f"(bot held {before.opponent.shields})")
         else:
-            print(f"[YOU] {move.label}")
+            print(f"[YOU] {move.label}  (bot held {before.opponent.shields} shields)")
+            hist = (f"T{before.turn} YOU: did not attack "
+                    f"(bot held {before.opponent.shields})")
         game["log"].append(move.label)
+        game["history"].append(hist)
     game["state"] = state
     save(game)
     print()
@@ -261,18 +312,18 @@ def cmd_move(args):
     else:
         sess = game.get("session")
         idx, total = (sess["done"] + 1, sess["total"]) if sess else (None, None)
-        print(render(state, idx, total))
+        print(render(state, idx, total, history=game.get("history")))
 
 
 def cmd_view(args):
     game = load()
     sess = game.get("session")
     idx, total = (sess["done"] + 1, sess["total"]) if sess else (None, None)
-    print(render(game["state"], idx, total))
+    print(render(game["state"], idx, total, history=game.get("history")))
 
 
 def cmd_end(args):
-    if not os.path.exists(STATE):
+    if not os.path.exists(_state_path()):
         print("no active game (state file absent)")
         return
     game = load()
@@ -286,8 +337,8 @@ def cmd_end(args):
     print(f"human hp left {sum(c.hp for c in s.player.characters)}, "
           f"bot hp left {sum(c.hp for c in s.opponent.characters)}")
     print(f"log: {game['log']}")
-    if os.path.exists(STATE):
-        os.remove(STATE)
+    if os.path.exists(_state_path()):
+        os.remove(_state_path())
 
 
 def human_move(state, a, d, b, sw=None):
@@ -307,24 +358,34 @@ def human_move(state, a, d, b, sw=None):
     return Allocation(a, d, b, sw)
 
 
-def run_bot(state, planner, verbose=True):
+def run_bot(state, planner, verbose=True, history=None):
     """Bot's turn: choose, resolve, and learn what it is entitled to."""
     before = state
     planning = state.__class__(state.opponent, state.player, state.turn, True)
     move = planner.choose(planning)
     after = apply(state, move)
-    # Bot learns the human's shields only if it attacked into them.
-    if move.attacks:
-        planner.observe_shields(before.player.shields)
+    # The human's shields are revealed on every resolution, regardless of
+    # whether the bot attacked (symmetrical with the human's UI). So the bot
+    # observes them every turn.
+    planner.observe_shields(before.player.shields)
     if verbose:
-        print(f"[BOT] {move.label}")
+        # Fairness: the bot's defends (shields) and bonuses (bank) are HIDDEN.
+        # Only its attacks, the damage, and the shields it consumed (revealed
+        # on the human's own attack) are public. Never print move.label here.
         if move.attacks:
             blocked = min(move.attacks, before.player.shields)
             landed = move.attacks - blocked
             dmg = exchange_damage(planning.player.active_character
                                   if not move.switch else planning.player.characters[move.switch_to],
                                   before.player.active_character, landed)
-            print(f"      attacked {move.attacks} (blocked {blocked}, landed {landed}, dmg {dmg})")
+            print(f"[BOT] attacked {move.attacks} (blocked {blocked}, landed {landed}, dmg {dmg})")
+            hist = (f"T{before.turn} BOT: a{move.attacks} -> {dmg} dmg "
+                    f"(blocked {blocked})")
+        else:
+            print("[BOT] did not attack")
+            hist = f"T{before.turn} BOT: did not attack"
+    if history is not None:
+        history.append(hist)
     return after
 
 
@@ -332,6 +393,8 @@ def main():
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest="cmd")
     pn = sub.add_parser("new")
+    pn.add_argument("--run", default="default",
+                    help="per-run sandbox folder under runs/ (parallel-safe)")
     pn.add_argument("--seed", default=None)
     pn.add_argument("--ai_first", action="store_true",
                     help="bot moves first (overrides the random coin flip)")
@@ -340,14 +403,17 @@ def main():
     pn.add_argument("--depth", type=int, default=2)
     pn.add_argument("--temp", type=float, default=0.12)
     ps = sub.add_parser("session")
+    ps.add_argument("--run", default="default")
     ps.add_argument("--games", type=int, default=20)
     ps.add_argument("--seed", type=int, default=0)
     ps.add_argument("--depth", type=int, default=2)
     ps.add_argument("--temp", type=float, default=0.12)
-    pm = sub.add_parser("move"); pm.add_argument("move")
-    pv = sub.add_parser("view")
-    pe = sub.add_parser("end")
+    pm = sub.add_parser("move"); pm.add_argument("--run", default="default")
+    pm.add_argument("move")
+    pv = sub.add_parser("view"); pv.add_argument("--run", default="default")
+    pe = sub.add_parser("end"); pe.add_argument("--run", default="default")
     args = p.parse_args()
+    _set_run(args.run)
     if args.cmd == "new":
         cmd_new(args)
     elif args.cmd == "session":

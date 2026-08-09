@@ -195,8 +195,8 @@ def play(player_team, bot_team, depth=SEARCH_DEPTH, input_fn=input, output_fn=pr
             planning = GameState(state.opponent, state.player, state.turn, True)
             move = bot.choose(planning)
             before = state
-            if move.attacks:
-                bot.observe_shields(before.player.shields)
+            # Human's shields are revealed every resolution, attack or not.
+            bot.observe_shields(before.player.shields)
             state = apply(state, move)
             show_resolution(before, move, state, "AI")
     winner = show_outcome(state, output_fn)

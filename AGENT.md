@@ -1,14 +1,57 @@
 # COTE Megaverse
 
-COTE Megaverse is a human-fair, hidden-intent, turn-based combat game. This
-file is the normative project specification. Code, UI, planner, benchmark,
-replay, and tests must follow it.
+COTE Megaverse is a human-fair, hidden-intent, turn-based combat game, and the
+subject of this project: **building an AI that beats a human at the highest
+possible win rate**. This file is the normative specification. Code, UI,
+planner, benchmark, replay, and tests must follow it. Reading it should give a
+complete picture of the project: what the game is, how it plays, what is shown
+when, and how the AI is built.
 
 `GameState` is authoritative resolver state, not a public observation. It
 contains secrets needed to resolve combat. A field being present in
 `GameState` never implies that the opponent may see or use it.
 
-## 1. Match Model
+---
+
+## 1. What This Project Is
+
+- A two-sided battle game. One side is the human, the other is the AI. Each
+  side fields three characters with types and stats.
+- The AI must win against humans with a high win rate. Humans win by making
+  few errors and by reading the AI; the AI wins by playing soundly (punishing
+  errors) while not being trivially readable.
+- The game is **imperfect-information**: when a side acts, the opponent's
+  shields and stored bonus are hidden. The heart of the game is committing
+  attacks and shields blind against that hidden state.
+- The AI is a **belief-based planner**, not a learned network: it maintains a
+  distribution over the opponent's hidden state, applies hard tactical gates,
+  scores candidate moves with strategic terms, and (only at genuine decision
+  points) samples among near-equal moves. See §10.
+- Tooling around the game lets anyone play against the AI (`play.py`), run
+  sessions, track win rates, and run other AI models as test subjects
+  (`play.py --run <name>` plus subagents). See §12.
+
+### 1.1 Quick gameplay narrative
+
+One match plays out like this:
+
+1. Teams and stats are sampled (3 characters per side; HP 5700-6300, ATK
+   1900-2100, types A/B/C/D). The first mover is a match parameter; in the
+   interactive and CLI harness it is random per game.
+2. On each turn the acting side gets an action budget and must spend every
+   action. Actions are: attacks (deal damage), defends (shields that block the
+   opponent's *next* turn), bonuses (bank actions for a later burst), and at
+   most one switch (change the active character, costs 1).
+3. Attacks resolve against the shields the opponent held from *its previous
+   turn* — you commit blind. After resolution the outcome is public.
+4. When an active character dies, the next living character is promoted for
+   free; the dead one leaves the order entirely.
+5. Kill all three of the opponent's characters to win. A match that hits the
+   configured turn limit is a draw.
+
+---
+
+## 2. Match Model
 
 - A match has two sides: human/player and AI/opponent.
 - Each side has exactly three characters. Duplicate types are allowed.
@@ -21,17 +64,22 @@ contains secrets needed to resolve combat. A field being present in
 - A side loses when all three of its characters are dead.
 - `turn` counts individual side turns, not pairs of turns.
 - Either side may act first. Interactive play defaults to the human acting
-  first, but the starting side is a match parameter, not a fixed rule.
+  first, but the starting side is a match parameter, not a fixed rule. The
+  `play.py` harness randomizes it per game.
 - Moving first is a measured structural advantage, not a cosmetic detail. With
   identical policies on both seats, the first mover wins about 68 percent of
   games with a random policy and about 58 percent with a greedy policy.
   Therefore every benchmark must play each seed twice, once per starting side,
   and report the seats separately as well as combined. A win rate measured on a
   single seat is not a valid strength measurement.
+- There is no built-in draw rule; matches end on a kill or at a configured
+  turn limit (the benchmark uses `max_half_turns`, default 100).
 - Pass a seeded `random.Random` to `initial()` when reproducible teams and
   stats are required.
 
-## 2. Character Types
+---
+
+## 3. Character Types
 
 Type advantage forms this cycle:
 
@@ -45,7 +93,9 @@ A > B > C > D > A
 - Type, ATK, current HP, max HP, alive/dead status, and active character are
   public information.
 
-## 3. Turns And Action Budgets
+---
+
+## 4. Turns And Action Budgets
 
 Base actions are determined by the global turn number:
 
@@ -88,7 +138,9 @@ The allocation invariant is:
 attacks + defends + bonuses + (1 if switched else 0) == available actions
 ```
 
-## 4. Switches, Order, And Death
+---
+
+## 5. Switches, Order, And Death
 
 - A voluntary switch may target any living, non-active character.
 - A voluntary switch costs one action.
@@ -97,17 +149,22 @@ attacks + defends + bonuses + (1 if switched else 0) == available actions
 - Therefore attacks in the same allocation use the newly active character's
   type and ATK.
 - A voluntary switch moves the selected character to the front of
-  `stack_order`.
+  `stack_order`; it remains at the front for the rest of the match.
 - If an active character dies, the next living character is promoted for free.
 - Forced promotion does not consume an action and is not a voluntary switch.
-- The promoted character becomes first in `stack_order`; the defeated active
-  character is retained immediately behind it in the internal order.
+- The promoted character is the first living character in the **target's own**
+  stack order (never the actor's order).
+- The dead active character is **removed from the order entirely**. The rebuilt
+  stack is `[promoted] + remaining living characters in their previous relative
+  order`. No dead entries and no duplicates ever appear in `stack_order`.
 - The UI always renders the active character first. Other living characters
   follow the real `stack_order`; display order is part of game state, not a
   cosmetic sort.
 - If no living character remains, the match ends immediately.
 
-## 5. Shields And Resolution
+---
+
+## 6. Shields And Resolution
 
 Shields have a one-opponent-turn lifecycle:
 
@@ -134,7 +191,9 @@ landed = attempted attacks - blocked
   damage resolution.
 - Damage cannot reduce HP below zero.
 
-## 6. Damage And Kill Arithmetic
+---
+
+## 7. Damage And Kill Arithmetic
 
 Damage is computed for the entire exchange and rounded exactly once:
 
@@ -163,9 +222,11 @@ Kill preview has a deliberately narrower meaning:
   evaluating a shield belief. Such totals must never replace the UI's landed
   attack preview.
 
-## 7. Information Model
+---
 
-### 7.1 Public Before An Allocation
+## 8. Information Model
+
+### 8.1 Public Before An Allocation
 
 Both sides may know:
 
@@ -178,7 +239,7 @@ Both sides may know:
 
 Each side also knows its own held shields.
 
-### 7.2 Hidden Before Resolution
+### 8.2 Hidden Before Resolution
 
 A side must not know or receive the opponent's:
 
@@ -199,23 +260,28 @@ them is where bluffing lives:
   resolution, so a full-budget attack proves a remainder of zero.
 - A bank is revealed when it is spent, not when it is taken. An action banked on
   turn `N` becomes public on turn `N + 2` through the budget.
-- A shield is revealed only when an attack hits it or when it expires unused. A
-  shield that is never tested is never confirmed.
+- A shield is revealed on every resolution, whether it was hit or expired
+  unused. The spent shield count is public each turn, including zero and turns
+  with no attack: a wasted shield is visible, so an opponent who shielded into
+  a banking player is seen to have wasted it.
 
-### 7.3 Public After Resolution
+### 8.3 Public After Resolution
 
 - A visible switch and its target become public.
 - If attacks were attempted, total attacks, shields encountered, landed hits,
   and resulting damage become public.
-- The defender's held shields are therefore known after an attack exchange.
-- If no attack occurred, the exact composition of the opponent's hidden
-  allocation is not printed. Public state changes may still reveal bonus or a
-  switch normally.
-- On every human allocation resolution, the UI explicitly reports the AI's
-  expired shield count as `AI spent X shields`, including `X == 0` and turns
-  where the human did not attack.
+- If no attack occurred, the exact composition of the opponent's allocation
+  (how the remainder split into defends vs bank) is not printed; public state
+  changes may still reveal a bonus or a switch normally.
+- The defender's held shield count is revealed on every resolution, attack or
+  not. On each of the acting side's allocations the UI reports the opponent's
+  expired shield count (`AI spent X shields` / `bot held X shields`),
+  including `X == 0` and turns with no attack. Wasted shields are always
+  visible; the split into the bank is not.
 
-## 8. Human-AI Fairness Contract
+---
+
+## 9. Human-AI Fairness Contract
 
 - Human and AI must make decisions from equivalent information boundaries.
 - AI knows its own state and held shields, just as the human knows theirs.
@@ -245,15 +311,15 @@ them is where bluffing lives:
   transparency on the following turn.
 - Shield worlds are pruned by later public facts, not by assumption. A revealed
   budget of `b` on the owner's next turn proves the bank was `b - base actions`,
-  which retroactively fixes the split of the earlier remainder. An attack
-  exchange reveals the defender's shields directly. Until such a fact arrives,
-  all splits stay live.
+  which retroactively fixes the split of the earlier remainder. Every
+  resolution reveals the defender's shield count, which also fixes the split.
+  Until such a fact arrives, all splits stay live.
 - Belief about currently held shields and prediction of the opponent's future
   allocation are separate models and must not be conflated.
-- Because held shields are almost never exactly inferable, candidate moves must
-  resolve in separate shield-world states. Continuation value combines
-  probability-weighted expectation with downside risk; it must not resolve the
-  move once against an invented zero-shield state.
+- Because held shields are almost never exactly inferable at decision time,
+  candidate moves must resolve in separate shield-world states. Continuation
+  value combines probability-weighted expectation with downside risk; it must
+  not resolve the move once against an invented zero-shield state.
 - Shield-world priors must use opponent rationality, not a uniform split. A
   split that hands the mover a guaranteed lethal is evidence against itself
   when the opponent had a safe alternative.
@@ -289,21 +355,77 @@ them is where bluffing lives:
   Only a revealed budget may be used to reconstruct a past bank. Predicting the
   opponent's next budget requires a distribution over its hidden bank, not the
   resolver value.
-- Public history may record attacks, revealed budgets, and visible switches.
+- Public history may record attacks, revealed budgets, visible switches, and
+  revealed shield counts.
 - Structured `PublicEvent` history may be used for public facts, but it must
   never contain hidden allocation intent. Policy belief is a soft forecast of
   opponent style, not permission to use private state.
-- Exact shields may enter planner history only after an attack exchange has
-  publicly revealed them.
+- Exact shields may enter planner history after any resolution, because they
+  are revealed every resolution (attack or not).
 - Interactive play, position analysis, benchmark, replay, and self-play must
   enforce the same boundary.
 - Self-play must use independent planner histories and alternate sides through
   the same `apply()` transition used by interactive play.
 - Never reintroduce perfect-information policies.
 
-## 9. Terminal UI Contract
+---
 
-### 9.1 State Preview
+## 10. Planner Architecture
+
+The planner (`agent.py` + `infoset.py` + `strategy.py`) is a deterministic
+reasoning engine with one controlled source of randomness. It has four layers:
+
+1. **Belief** (`infoset.py::OpponentModel`). The only sanctioned source of
+   opponent hidden state. It keeps a joint distribution over `(shields, bank)`
+   candidates paid out of the same public remainder, updated by revealed
+   budgets, revealed shield counts, and attack exchanges. It never reads the
+   resolver's opponent fields.
+
+2. **Gates** (hard, unconditional). Match-winning moves are taken first; moves
+   that permit a guaranteed immediate loss in any shield world are excluded
+   when a safe alternative exists; guaranteed-lethal-and-defense outranks a
+   bare lethal. Dominated switches (to a strictly weaker body) are never
+   sampled. These gates are checked before any scoring.
+
+3. **Scoring** (heuristic, over the safe candidates). Material, living bodies,
+   survival, tempo, switch value, burst setup, and four strategic terms:
+   - `punish_banking`: if the opponent is exposed and banking, pressure with
+     attacks instead of mirroring passivity;
+   - `deny_burst`: if the opponent is banking a big burst, shields must be
+     enough to survive its worst case — shields that cannot save are penalised
+     (this breaks the "turtle", i.e. shielding 4 every turn forever);
+   - `desperation`: when behind in living bodies, prefer threat over pure
+     defense (no turtling to death);
+   - `burst_setup`: banking is rewarded only when it converts the next turn
+     into a lethal burst.
+
+4. **Context-conditional mixing** (the only randomness). By default the bot is
+   deterministic (argmax of the safe candidates). When `temperature > 0` and an
+   RNG is set, it samples only among the moves that are genuinely close to the
+   best (within `band_fraction` of the best score) and only when at least two
+   such moves exist. This keeps the bot strong and hard to read without ever
+   randomizing into a dominated move. `temperature == 0` is fully deterministic
+   and is the default for tests.
+
+`strategy.py::Objective` classifies the situation (`finish`, `survive`,
+`deny_burst`, `break_stall`, `prepare_burst`, `normal`); it is advisory and is
+only one term in the score. `switch_value` rewards switching to a body that
+deals more damage to the opponent's active or that survives better than the
+current active, and never recommends a strictly worse switch.
+
+### 10.1 Self-play and reference tools
+
+- `solve1v1.py` is an exact CFR-style equilibrium solver for a reduced 1v1
+  game (no switches, fixed stats). It is a laboratory for equilibrium values
+  and calibration, not part of the live bot.
+- `strategy.py` and `agent.py` must remain human-fair; never reintroduce
+  resolver-state reads for opponent secrets.
+
+---
+
+## 11. Terminal UI Contract
+
+### 11.1 State Preview
 
 - Render human side, AI side, current turn, acting side, characters, HP bars,
   HP, ATK, types, active marker, and living stack order.
@@ -316,12 +438,14 @@ them is where bluffing lives:
   the AI's action budget on its own turn is public, and that budget reveals the
   bank it just drained. Never render an AI bonus meter, AI held shields, or an
   AI allocation.
+- The acting side's budget is shown as `Actions: base + bonus` (base actions
+  from the turn plus the bank revealed on its own turn).
 - Matchup multiplier and potential one-attack aggregate damage may be shown.
 - Show `[KILL possible] N attacks needed` only when the unblocked kill-preview
   count is within the human's currently available actions.
 - Never include possible or current AI shields in kill-preview count.
 
-### 9.2 Allocation Input
+### 11.2 Allocation Input
 
 - Human commands are `a=atk`, `s=shield`, `b=bonus`, and `sw=switch`.
 - Prompt until every available action has been allocated.
@@ -332,23 +456,26 @@ them is where bluffing lives:
 - Never print `AI selected: aN/dN/bN`, `move.label`, planner alternatives, or
   any equivalent AI allocation summary in interactive play.
 
-### 9.3 Resolution Output
+### 11.3 Resolution Output
 
 - Start a separate resolution block labeled `You turn #N` or `AI turn #N`.
 - Show a resolved switch when one occurred.
-- On every `You turn #N`, print `AI spent X shields` using the AI shields held
-  before this resolution. Never use the AI's newly selected future `defends`.
+- On every `You turn #N`, print the AI's held shield count (the shields held
+  before this resolution), regardless of whether the human attacked. Never use
+  the AI's newly selected future `defends`.
+- The AI side observes the human's held shields on every resolution,
+  symmetrically.
 - Never print `You spent X shields`.
 - A fully blocked attack prints `BLOCK!` and
   `<side>: N attacks vs X shields`.
 - A partially blocked or unblocked attack prints total attempted attacks,
   resolved shields, landed hits, and aggregate damage.
-- If no attack was allocated, print `<side> did not attack`.
-- `AI spent X shields` still appears when the human did not attack.
+- If no attack was allocated, print `<side> did not attack`, still reporting
+  the opponent's held shield count.
 - The completed exchange may reveal shields; this is a public result, not an
   information leak.
 
-### 9.4 Match End
+### 11.4 Match End
 
 - The final move uses the same normal resolution block as every other move.
 - After that block, do not render another state table or a `BATTLE OVER`
@@ -357,47 +484,75 @@ them is where bluffing lives:
   over.
 - Print only `YOU WIN`, `YOU LOSE`, or `DRAW` as the final result.
 
-## 10. State And Transition Invariants
+---
 
-- `Character`, `Side`, `GameState`, and `Allocation` are immutable value
-  objects; transitions return new state.
-- `rules.py` is the single authority for legal allocations and resolution.
-- `apply()` validates that the complete budget was spent.
-- The acting side's current allocation resolves against shields already held
-  by the target.
-- The actor's newly selected defends and bonuses are stored after resolution.
-- The target's old shields are cleared after resolution.
-- Turn increments by one, acting side flips, and the next side is prepared.
-- `prepare()` drains the whole bank into the budget. Consequently `Side.bonus`
-  is zero during its owner's own allocation, and a nonzero `Side.bonus` is
-  always the opponent's hidden stored bank. Reading that field from the
-  planner is a fairness violation, not an optimisation.
-- `Side.shields` is likewise hidden state. Only `observation.py` decides what
-  crosses the boundary.
-- UI and planner must not independently mutate resolver state.
-- Seeded RNG is required for reproducible tests, benchmark, and replay.
-- Benchmark must include seeded human-like policies (`random`, `greedy`, and
-  `bonus_shield`) and report wins, losses, draws, and missed guaranteed lethal
-  counts separately. Self-play alone is not a human-strength benchmark.
+## 12. Harness And Tooling
 
-## 11. Source Layout
+### 12.1 `play.py` — the game harness
+
+`play.py` is the headless harness used by a human, by this assistant, and by
+test-subject subagents. It enforces the same fairness boundary as
+`interactive.py` (no opponent shields or bank in the preview; shields revealed
+on every resolution; budget shown as `Actions: base + bonus`).
+
+Commands (all take `--run <name>` for per-session isolation):
+
+- `new --seed N [--temp T] [--ai_first|--human_first]` — start a game. The
+  first mover is random by default.
+- `move --run <name> "a,d,b"[,sw]` — play your turn; the bot responds
+  automatically. `a/d/b` must sum to your budget; `sw` is a 1-based switch
+  target.
+- `move --run <name> -` — advance the bot's turn when it moves first.
+- `view` / `end` — show the state / finish and record the result.
+- `session --games N` — play N games back-to-back, each recorded
+  automatically with a timestamp.
+- The state display includes a `-- history (public) --` section with the
+  last turns' public outcomes (attacks, damage, revealed shields), so a player
+  can read the opponent's patterns without remembering every line.
+
+Per-run isolation: state and logs live under `runs/<name>/` (`state.pkl`,
+`session_log.json`, `winrate_log.json`). Parallel sessions never collide.
+
+### 12.2 `track_winrate.py` — statistics
+
+`track_winrate.py add/show/reset [--run <name>]` records results and reports
+the human's win rate with a 95% Wilson confidence interval, per-seat splits,
+per-block (25) progress to expose learning curves, and advice on when the
+sample is large enough. `runs/<name>/winrate_log.json` is the source of truth
+for a session.
+
+### 12.3 Subagent test subjects
+
+`.opencode/agent/` defines subagents that play the game as the human via
+`play.py --run <name>`, so the AI can be evaluated against other AI models
+(flagship and free models). Each subagent writes its results to its own
+`runs/<name>/` folder as it goes, so a broken or interrupted subagent never
+loses completed games. Because the CLI hides the opponent's shields and bank,
+these tests measure real strength against the same information a human sees.
+
+### 12.4 Source layout
 
 - `src/cote_megaverse/rules.py`: authoritative immutable state, legal moves,
   damage, and transitions.
+- `src/cote_megaverse/infoset.py`: opponent belief model (public-information
+  shield/bank distribution).
 - `src/cote_megaverse/observation.py`: public observation boundary.
-- `src/cote_megaverse/agent.py`: public-history belief model and bounded
-  planner.
+- `src/cote_megaverse/agent.py`: planner — gates, scoring, mixing.
 - `src/cote_megaverse/strategy.py`: objectives and switch valuation.
 - `src/cote_megaverse/interactive.py`: human-fair terminal game and display
   contract.
-- `src/cote_megaverse/benchmark.py`: seeded fair self-play, analysis, and
-  replay reports.
+- `src/cote_megaverse/benchmark.py`: seeded fair self-play, analysis, replay.
+- `src/cote_megaverse/solve1v1.py`: exact 1v1 equilibrium solver (laboratory).
 - `src/cote_megaverse/cli.py`: position-analysis entry point.
-- `tests/test_new_engine.py`: core rules and planner tests.
-- `tests/test_layers.py`: observation, fairness, strategy, and benchmark tests.
-- `tests/test_interactive.py`: terminal visibility and rendering tests.
+- `play.py`, `track_winrate.py`: harness and statistics (see above).
+- `tests/test_new_engine.py`, `tests/test_layers.py`,
+  `tests/test_interactive.py`: rules, fairness, strategy, benchmark, and
+  terminal-visibility tests.
+- `.opencode/agent/`: subagent test subjects.
 
-## 12. Verification And Commands
+---
+
+## 13. Verification And Commands
 
 Run the complete suite after changes to rules, state, planner, visibility, or
 UI:
@@ -406,7 +561,7 @@ UI:
 python -m unittest discover -s tests -p "test_*.py" -v
 python -m src.cote_megaverse.interactive
 python -m src.cote_megaverse.cli --team A,B,C --opponent B,C,C --depth 3
-python -m py_compile src/cote_megaverse/rules.py src/cote_megaverse/agent.py src/cote_megaverse/observation.py src/cote_megaverse/interactive.py src/cote_megaverse/benchmark.py src/cote_megaverse/cli.py
+python -m py_compile src/cote_megaverse/rules.py src/cote_megaverse/agent.py src/cote_megaverse/observation.py src/cote_megaverse/interactive.py src/cote_megaverse/benchmark.py src/cote_megaverse/cli.py src/cote_megaverse/infoset.py src/cote_megaverse/solve1v1.py
 git diff --check
 ```
 
@@ -421,43 +576,44 @@ is played once with the human policy first and once with AI first. Do not
 interpret self-play win rate as human win rate. Record wins, losses, draws,
 missed guaranteed lethals, and guaranteed-loss moves separately.
 
+Evaluate against human-like play with the harness:
+
+```powershell
+python play.py session --games 20 --temp 0.12
+python track_winrate.py show
+```
+
 Do not reintroduce genome evolution, LSTM/NumPy/Numba legacy planners, legacy
 compatibility wrappers, or perfect-information behavior without an explicit
 design decision and corresponding specification update.
 
-## 13. Known Defects
+---
 
-These are confirmed by measurement and must be fixed before any win-rate
-number is trusted.
+## 14. Known Issues And History
 
-- `benchmark.py` calls `planner.observe_shields(before.opponent.shields)` on the
-  human's turn. When the human is `player`, `before.opponent` is the AI itself,
-  so the AI's own shields are written into its model of the human. Belief
-  top-1 was wrong in 9 of 23 audited plies. `interactive.py` passes
-  `before.player.shields` and is correct. Because of this, live play and the
-  benchmark measured different games, and all historical win-rate numbers from
-  the benchmark are void.
-- `PublicHistory.observe()` computes `shields = budget - attacks - bonuses -
-  switch`, using the opponent's true `bonuses`. That value is hidden at
-  decision time. It must derive a remainder and keep every split live.
-- `Planner.belief()` returns `ShieldBelief({n: 1.0})` from that derivation, so
-  the shield-world machinery required by section 8 never activates. All
-  candidate moves resolve in a single invented world.
-- `Planner.opponent_allocations()` reads `state.opponent.bonus` through
-  `next_budget()`. That is the opponent's hidden bank.
-- `PublicEvent.attack_rate`, `defend_rate`, and `bonus_rate` reference
-  `self.actions`, which does not exist on that class. They raise
-  `AttributeError` if called and are dead code.
-- `observation.py` copies `side.bonus` into `PublicSide` for both sides, so the
-  public observation leaks the opponent's hidden bank. Only the acting side's
-  own bank and the opponent's revealed budget may cross that boundary.
-  `PublicObservation.opponent_next_budget` is built from the same leaked field
-  and must instead return a distribution over the hidden bank.
-- `tests/test_layers.py::test_planner_infers_held_shields_from_public_budget`
-  asserts the old, wrong model: budget 5 with 3 attacks and 0 bonuses gives
-  `held_shields == 2`. Under section 8 that situation yields a remainder of 2
-  and three live shield worlds. This test must be replaced, not preserved.
-- Benchmark reporting must alternate seats and report per-seat results, because
-  moving first is worth roughly 68 percent for `random` and 58 percent for
-  `greedy` in symmetric self-play. A single-seat number is not a strength
-  measurement.
+Items that were measured bugs and have been fixed; keep them so regressions
+are caught:
+
+- Winner label in `benchmark.run_match` was inverted (`state.opponent` is the
+  AI, so `opponent.lost` meant the AI lost, yet it was labelled the winner).
+  Historical win-rate numbers from before the fix are void.
+- Forced promotion used the actor's stack order and left dead/duplicate
+  entries in the order. Now it promotes the first living character from the
+  target's own order and rebuilds a clean stack (see §5).
+- The CLI and the interactive UI disagreed on switch-target indexing
+  (0-based vs 1-based). The CLI now takes 1-based targets.
+- The harness and bot revealed the opponent's shields only on attack. Shields
+  are now revealed on every resolution, symmetrically for human and AI
+  (see §8).
+- The `PublicEvent` rate properties reference a nonexistent field and are dead
+  code.
+
+Items that remain open (not bugs, but known engineering debt):
+
+- `PublicHistory` still derives an exact shield count from the opponent's true
+  bonuses; the fair belief path is `OpponentModel`, and `PublicHistory` is
+  kept for behavioural policy estimates. Do not let the derived value leak into
+  `Planner.belief()`.
+- The heuristic scoring terms are hand-tuned and overlapping; they are the
+  calibration target if a principled utility replaces them.
+- `solve1v1.py` is a working laboratory but not a converged full-game solver.

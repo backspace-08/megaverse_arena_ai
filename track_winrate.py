@@ -18,8 +18,8 @@ import math
 import os
 import sys
 
-LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                   "winrate_log.json")
+_BASE = os.path.dirname(os.path.abspath(__file__))
+LOG = os.path.join(_BASE, "runs", "default", "winrate_log.json")
 
 
 def _wilson(wins, games, z=1.96):
@@ -122,12 +122,18 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     sub = p.add_subparsers(dest="cmd")
     pa = sub.add_parser("add")
+    pa.add_argument("--run", default="default",
+                    help="per-run log under runs/<run>/winrate_log.json")
     pa.add_argument("result", help="string of w/l/d, e.g. wwldl")
     pa.add_argument("--seat", default="mixed",
                     help="tag like ai_first or human_first")
     ps = sub.add_parser("show")
+    ps.add_argument("--run", default="default")
     pr = sub.add_parser("reset")
+    pr.add_argument("--run", default="default")
     args = p.parse_args()
+    global LOG
+    LOG = os.path.join(_BASE, "runs", args.run, "winrate_log.json")
     if args.cmd == "add":
         cmd_add(args)
     elif args.cmd == "show":

@@ -23,6 +23,16 @@ from dataclasses import dataclass, field
 from .rules import MAX_ACTIONS, MAX_BONUS, base_budget
 
 
+def _binomial(n: int, k: int) -> float:
+    """Small binomial coefficient for split weighting."""
+    if k < 0 or k > n:
+        return 0.0
+    result = 1.0
+    for i in range(min(k, n - k)):
+        result = result * (n - i) / (i + 1)
+    return result
+
+
 def legal_splits(remainder: int, capacity: int = MAX_BONUS):
     """Every legal ``(shields, bank)`` split of a public remainder.
 
@@ -111,6 +121,14 @@ class OpponentModel:
             self._restrict(lambda shields, bank: shields == blocked)
         else:
             self._restrict(lambda shields, bank: shields >= attacks)
+        # The revealed split also feeds the behavioural prior (``defend_share``):
+        # an opponent repeatedly observed holding no shields is a banker, so the
+        # next remainder must lean toward bank rather than stay near-uniform.
+        total = sum(self._candidates.values()) or 1.0
+        exp_shields = sum(shields * w for (shields, _), w in self._candidates.items()) / total
+        exp_bank = sum(bank * w for (_, bank), w in self._candidates.items()) / total
+        self._defend_count += exp_shields
+        self._bank_count += exp_bank
 
     def expire_shields(self):
         """Clear held shields after our allocation resolved. Bank survives."""
@@ -176,13 +194,29 @@ class OpponentModel:
     # ---------------------------------------------------------------- helpers
 
     def _prior(self, remainder: int) -> dict[tuple[int, int], float]:
-        """Weight each legal split by observed splitting behaviour."""
-        share = self.defend_share
+        """Weight each legal split by observed splitting behaviour.
+
+        Model each action in the remainder as independently going to a defend
+        with probability ``defend_share``, giving a binomial weight over the
+        legal splits. The previous linear blend was far too flat: an opponent
+        who had demonstrably never shielded still got ~0.09 weight on "holding
+        four shields" and only ~0.31 on "holding none", so evidence barely
+        moved the belief and the planner could neither punish a banking
+        opponent nor trust its own damage estimate.
+
+        ``EPSILON`` keeps every legal split alive. AGENT.md §9 requires that
+        splits be pruned by public facts, never by assumption, so no world may
+        ever reach exactly zero here; only ``_restrict`` (hard evidence) removes
+        worlds.
+        """
+        EPSILON = 0.02
+        share = min(0.98, max(0.02, self.defend_share))
         weights: dict[tuple[int, int], float] = {}
         for shields, bank in legal_splits(remainder):
-            total = max(1, shields + bank)
-            weight = 0.25 + share * (shields / total) + (1 - share) * (bank / total)
-            weights[(shields, bank)] = weight
+            weight = (_binomial(shields + bank, shields)
+                      * share ** shields
+                      * (1.0 - share) ** bank)
+            weights[(shields, bank)] = weight + EPSILON
         return weights
 
     def _restrict(self, predicate):

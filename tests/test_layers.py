@@ -7,6 +7,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), "src
 
 from cote_megaverse.agent import Planner, ShieldBelief
 from cote_megaverse.benchmark import benchmark_policies, run_match, run_self_play
+from cote_megaverse.infoset import OpponentModel
 from cote_megaverse.observation import observe
 from cote_megaverse.rules import Type, base_budget, initial
 from cote_megaverse.strategy import Objective, marginal_bonus_value, switch_value
@@ -172,6 +173,71 @@ class LayerTests(unittest.TestCase):
         report = benchmark_policies(seeds=range(2), depth=1, max_half_turns=4)
         self.assertEqual(set(report), {"random", "greedy", "bonus_shield"})
         self.assertEqual(report["greedy"]["games"], 4)
+
+
+class BeliefSharpnessTests(unittest.TestCase):
+    """The split prior must actually learn, while keeping every world live."""
+
+    def test_prior_follows_observed_split_behaviour(self):
+        # An opponent that spends its whole budget on attacks and bonuses, and
+        # is then observed to have held zero shields, is a banker. The belief
+        # must concentrate on "few shields", not stay near-uniform: a flat
+        # prior is what stopped the planner from punishing a banking opponent.
+        banker = OpponentModel()
+        for turn in (1, 3, 5):
+            banker.observe_turn(turn, base_budget(turn), attacks=0)
+            banker.observe_our_attack(1, 0)
+        banker.observe_turn(7, base_budget(7), attacks=0)
+        distribution = banker.shield_distribution()
+        self.assertGreater(distribution.get(0, 0.0), 0.5)
+        self.assertGreater(distribution[0], distribution.get(4, 0.0) * 5)
+
+    def test_prior_keeps_every_legal_split_live(self):
+        # AGENT.md §9: splits are pruned by public facts, never by assumption.
+        # However confident the behavioural read is, no legal world may be
+        # assigned zero probability.
+        banker = OpponentModel()
+        for turn in (1, 3, 5):
+            banker.observe_turn(turn, base_budget(turn), attacks=0)
+            banker.observe_our_attack(1, 0)
+        banker.observe_turn(7, base_budget(7), attacks=0)
+        distribution = banker.shield_distribution()
+        remainder = base_budget(7)
+        for shields in range(remainder + 1):
+            self.assertGreater(distribution.get(shields, 0.0), 0.0)
+
+
+class LossGateTests(unittest.TestCase):
+    """The safety gate must see bursts paid for out of a believed bank."""
+
+    def test_reply_budget_uses_believed_bank_not_masked_state(self):
+        # `choose` masks the opponent's bank to zero for fairness. If the loss
+        # gate sized the opponent's reply from that masked value it would be
+        # blind to every banked burst, which is the bank-and-burst hole.
+        state = initial((Type.A,), (Type.A,))
+        # 4 attacks (no bank) deal 7600, 8 attacks (bank 4) deal 15200, so an
+        # HP of 9000 makes the no-bank reply survivable but the banked one
+        # lethal — that is the flip the test must exercise.
+        weak = replace(state.player.characters[0], hp=9000, atk=1900)
+        state = replace(
+            state,
+            player=replace(state.player, characters=(weak,), stack_order=(0,)),
+            opponent=replace(state.opponent, bonus=0),
+            turn=7)
+        planner = Planner(depth=1)
+        # Same position, two different believed banks: a bigger bank buys a
+        # bigger reply, so it must be able to flip the verdict.
+        without_bank = planner._reply_kills_us(state, 0)
+        with_bank = planner._reply_kills_us(state, 4)
+        self.assertFalse(without_bank)
+        self.assertTrue(with_bank)
+
+    def test_loss_gate_ignores_positions_with_spare_bodies(self):
+        # Only the active character can be damaged in one allocation, so a side
+        # with a spare body cannot be wiped by a single reply.
+        state = initial((Type.A, Type.A, Type.A), (Type.A, Type.A, Type.A))
+        planner = Planner(depth=1)
+        self.assertFalse(planner._reply_kills_us(state, 4))
 
 
 if __name__ == "__main__":

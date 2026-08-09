@@ -151,6 +151,12 @@ class TacticalOutcome:
     guaranteed_immediate_loss: bool
     lethal_probability: float
     wins_match: bool = False
+    # Probability mass of the believed worlds in which the opponent's next
+    # allocation can end the match. `guaranteed_immediate_loss` is the special
+    # case where this covers every live world. Tracking the partial case lets
+    # the planner prefer a move that dies in no world over one that dies in a
+    # credible few, as required by the safety-gate rule in AGENT.md §9.
+    loss_probability: float = 0.0
 
 
 class Planner:
@@ -175,6 +181,11 @@ class Planner:
         self._search_cache = {}
         self.passive_streak = 0
         self._observed_turns = 0
+        # Credible opponent bank for evaluation, refreshed each `choose` from
+        # OpponentModel. Kept as state (not a parameter) so the existing
+        # `_search`/`evaluate` call sites stay unchanged. It is public
+        # inference, never a resolver read.
+        self._believed_bank = 0
 
     def observe(self, attacks, bonuses=None, switched=False, budget=None,
                 turn=None):
@@ -300,29 +311,62 @@ class Planner:
                 return 5000.0 * bank_after
         return 0.0
 
+    def _reply_kills_us(self, child: GameState, bank: int) -> bool:
+        """Can the opponent's next allocation end the match against us?
+
+        ``child`` is the position after our allocation resolved, so
+        ``child.player`` is us and ``child.player.shields`` are the shields we
+        just committed. ``bank`` is a *believed* bank from ``OpponentModel``,
+        never a resolver read: it sets the reply budget we must survive.
+
+        Only our active character can take damage in one allocation, so we can
+        only be wiped when the active is our last living body. That makes the
+        test a damage comparison instead of a full reply enumeration, which is
+        both exact for this question and far cheaper.
+        """
+        if child.player.alive_count > 1:
+            return False
+        defender = child.player.active_character
+        budget = min(MAX_ACTIONS, base_budget(child.turn) + max(0, bank))
+        attacker_side = child.opponent
+        for index, character in enumerate(attacker_side.characters):
+            if not character.alive:
+                continue
+            switch_cost = 0 if index == attacker_side.active else 1
+            attacks = max(0, budget - switch_cost - child.player.shields)
+            if exchange_damage(character, defender, attacks) >= defender.hp:
+                return True
+        return False
+
     def tactical_outcome(self, state: GameState, move: Allocation,
                          belief: ShieldBelief, facts: TacticalFacts):
-        """Evaluate hard tactical facts across every live shield world.
+        """Evaluate hard tactical facts across every live joint world.
 
-        A move loses if *any* world permits a forced loss, and wins only if
-        *every* world ends the match. Averaging over worlds would hide exactly
-        the disaster branch that matters.
+        Worlds are joint ``(shields, bank)`` hypotheses from the belief model,
+        not shield marginals. The bank matters as much as the shields: it sets
+        the budget of the reply we must survive. Masking the opponent's bank to
+        zero (which ``choose`` must do for fairness) would otherwise make an
+        eight-action burst invisible to this gate, which is exactly the
+        bank-and-burst hole a human exploits.
+
+        ``loses_in_some_world`` is tracked separately from
+        ``guaranteed_immediate_loss``: §9 requires preferring a move that loses
+        in no world, while only an all-worlds loss is unavoidable.
         """
         guaranteed_loss = True
         wins_match = True
-        for shields in belief.probabilities:
-            resolver_state = replace(
-                state, opponent=replace(state.opponent, shields=shields))
+        loss_weight = 0.0
+        for world in self.model.worlds():
+            resolver_state = replace(state, opponent=replace(
+                state.opponent, shields=world.shields, bonus=0))
             child = apply(resolver_state, move)
             if not child.opponent.lost:
                 wins_match = False
-            world_loss = False
-            if not child.opponent.lost:
-                for reply in legal_allocations(child.opponent):
-                    if apply(child, reply).player.lost:
-                        world_loss = True
-                        break
-            if not world_loss:
+            world_loss = (not child.opponent.lost
+                          and self._reply_kills_us(child, world.bank))
+            if world_loss:
+                loss_weight += world.probability
+            else:
                 guaranteed_loss = False
         return TacticalOutcome(
             guaranteed_lethal=facts.guaranteed_lethal,
@@ -330,6 +374,7 @@ class Planner:
             guaranteed_immediate_loss=guaranteed_loss,
             lethal_probability=facts.lethal_probability,
             wins_match=wins_match,
+            loss_probability=loss_weight,
         )
 
     def choose(self, state: GameState) -> Allocation:
@@ -344,6 +389,10 @@ class Planner:
         # rather than averaged away.
         credible_bank = max((bank for bank, p in bank_belief.items() if p >= 0.15),
                             default=0)
+        # Feed the credible bank to `evaluate`, whose opponent-reply budget was
+        # otherwise computed from the bank we just masked to zero, making every
+        # banked burst invisible to the search.
+        self._believed_bank = credible_bank
         self._search_cache.clear()
         effective_depth = self.depth + (
             1 if state.player.alive_count + state.opponent.alive_count <= 3 else 0)
@@ -426,7 +475,23 @@ class Planner:
                     desperation = move.bonuses * 250.0      # set up a burst
                 if move.attacks == 0 and move.defends > 0 and move.bonuses == 0:
                     desperation -= move.defends * 400.0      # pure turtle
-            score += punish + desperation
+            # deny_burst calibration: if the opponent is banking a big burst,
+            # shields must be enough to survive its worst case — otherwise they
+            # are wasted (the endgame turtle) and attacking/banking is better.
+            deny_burst = 0.0
+            if opponent_banking:
+                worst_burst = min(MAX_ACTIONS, base_budget(state.turn + 1)
+                                  + credible_bank)
+                incoming = exchange_damage(
+                    state.opponent.active_character,
+                    state.player.active_character,
+                    max(0, worst_burst - move.defends))
+                if move.defends:
+                    if incoming < state.player.active_character.hp:
+                        deny_burst = 450.0 * move.defends      # survives: good
+                    else:
+                        deny_burst = -450.0 * move.defends     # wasted: turtle
+            score += punish + desperation + deny_burst
             components = {
                 "continuation": continuation,
                 "expected_damage": facts.expected_damage * 0.6,
@@ -438,6 +503,7 @@ class Planner:
                 "burst_setup": burst_setup,
                 "punish_banking": punish,
                 "desperation": desperation,
+                "deny_burst": deny_burst,
                 "expected_incoming": incoming,
                 "passive_streak": self.passive_streak,
             }
@@ -445,6 +511,7 @@ class Planner:
             components["guaranteed_lethal"] = outcome.guaranteed_lethal
             components["kill_and_defend"] = outcome.kill_and_defend
             components["guaranteed_immediate_loss"] = outcome.guaranteed_immediate_loss
+            components["loss_probability"] = outcome.loss_probability
             scored.append((score, move, facts, components, outcome))
         # Gate precedence matters. A move that ends the match is unconditionally
         # best: nothing can follow it. A kill that merely removes one body is
@@ -454,12 +521,23 @@ class Planner:
         if match_winners:
             scored = match_winners
         else:
-            safe = [item for item in scored if not item[4].guaranteed_immediate_loss]
-            if safe:
-                scored = safe
+            # AGENT.md §9: "Prefer a move that loses in no world over a move
+            # with a higher score that loses in one." Filter to fully safe moves
+            # first; only if every move risks death do we fall back to the
+            # least risky set, which is what `loss_probability` ranks below.
+            fully_safe = [item for item in scored
+                          if item[4].loss_probability <= 0.0]
+            if fully_safe:
+                scored = fully_safe
+            else:
+                safe = [item for item in scored
+                        if not item[4].guaranteed_immediate_loss]
+                if safe:
+                    scored = safe
         scored.sort(key=lambda item: (
             item[4].wins_match,
             not item[4].guaranteed_immediate_loss,
+            -item[4].loss_probability,
             item[4].kill_and_defend,
             item[4].guaranteed_lethal,
             item[4].lethal_probability,
@@ -584,8 +662,16 @@ class Planner:
         self._search_cache[key] = value
         return value
 
-    @staticmethod
-    def evaluate(state, depth=0):
+    def evaluate(self, state, depth=0):
+        """Static positional value, with the opponent's bank supplied by belief.
+
+        ``choose`` masks ``state.opponent.bonus`` to zero for fairness, so this
+        function must not read it to size the opponent's reply: doing so made
+        every banked burst invisible to the search and was the mechanical cause
+        of the bank-and-burst hole. ``self._believed_bank`` is the credible bank
+        from ``OpponentModel`` (public inference), and deeper in the search the
+        simulated bonus legitimately grows, so take whichever is larger.
+        """
         if state.opponent.lost:
             return 100000 + max(0, depth) * 100
         if state.player.lost:
@@ -593,7 +679,8 @@ class Planner:
         material = (sum(c.hp for c in state.player.characters)
                     - sum(c.hp for c in state.opponent.characters)) * 1.5
         bodies = (state.player.alive_count - state.opponent.alive_count) * 2600
-        bonus = (state.player.bonus - state.opponent.bonus) * 450
+        believed_bank = max(state.opponent.bonus, self._believed_bank)
+        bonus = (state.player.bonus - believed_bank) * 450
 
         def pressure(actor: Side, target: Side, budget: int) -> float:
             best = 0
@@ -608,7 +695,8 @@ class Planner:
 
         if state.player_to_move:
             player_budget = state.player.actions
-            opponent_budget = next_budget(state.turn + 1, state.opponent)
+            opponent_budget = min(
+                MAX_ACTIONS, base_budget(state.turn + 1) + believed_bank)
         else:
             player_budget = next_budget(state.turn + 1, state.player)
             opponent_budget = state.opponent.actions
