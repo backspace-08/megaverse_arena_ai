@@ -1,7 +1,7 @@
 ---
 description: Test subject (FLAGSHIP - Gpt 5.6 sol) that plays COTE Megaverse against the bot and reports a win rate. Use when launching a subagent to play the game via play.py with --run sol56-flagman.
 mode: subagent
-model: close-ai/gpt-5.6-sol
+model: cheaprouter/gpt-5.6-sol
 temperature: 0.3
 ---
 
