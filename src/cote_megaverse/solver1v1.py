@@ -1,4 +1,4 @@
-"""1v1 equilibrium solver with HP -> hits-to-kill abstraction.
+﻿"""1v1 equilibrium solver with HP -> hits-to-kill abstraction.
 
 OPTIMIZED VERSION (17% faster on cap=8):
 - Pre-computed flattened indices for reach propagation
@@ -8,7 +8,7 @@ OPTIMIZED VERSION (17% faster on cap=8):
 
 The core optimization: real HP is only ever compared against damage, and damage
 is a multiple of `atk * mult` per landed hit. So each side's HP is abstracted to
-`k = ceil(hp / (opp_atk * opp_mult))` — the number of landed hits needed to kill
+`k = ceil(hp / (opp_atk * opp_mult))` вЂ” the number of landed hits needed to kill
 it. An exchange with `landed` landed hits simply decrements the defender's `k`.
 This shrinks the state space by ~two orders of magnitude (e.g. 161x161 HP grid
 becomes ~9x9 hit counts).
@@ -24,12 +24,13 @@ the current strategy is computed once per iteration, and the forward/value
 passes are batched over the DAG's topological levels.
 
 Counterfactual values are aggregated from the CONCRETE child states (per-state
-bottom-up value), never from a stored per-info-set value — that averaging over
+bottom-up value), never from a stored per-info-set value вЂ” that averaging over
 hidden splits prevented the regrets from converging.
 
-Draw rules match the real game's spirit: a side that stalls (walls) for
-`stall_cap` own turns LOSES (against a competent opponent the wall is a loss,
-not a draw); a game past `cap` half-turns is a draw.
+Draw rules: a game past `cap` half-turns is a draw. Stalling is not punished by
+a hard rule: gamma discounting already makes prolonged stalling suboptimal, so
+no stall counters are tracked in the state (each side's own stall count was
+removed — it duplicated info sets without affecting outcomes).
 
 Utility from player A's perspective: +1 A wins, -1 B wins, 0 draw.
 """
@@ -80,9 +81,9 @@ class Solver:
         self.dtype = dtype
         self.gamma = gamma
         self._t = 0
-        self.start_root = (self.hA0, self.hB0, 0, 0, 0, 0, 0, 0, start_turn, 0)
+        self.start_root = (self.hA0, self.hB0, 0, 0, 0, 0, start_turn, 0)
         self.start_states = [
-            (self.hA0, self.hB0, 0, bankB, 0, shB, 0, 0, start_turn, 0)
+            (self.hA0, self.hB0, 0, bankB, 0, shB, start_turn, 0)
             for shB in range(opp_remainder + 1)
             for bankB in (opp_remainder - shB,)
         ]
@@ -103,27 +104,25 @@ class Solver:
 
     # ------------------------------------------------------------------ rules
     def actions(self, st):
-        hA, hB, bankA, bankB, shA, shB, stA, stB, turn, to_move = st
+        hA, hB, bankA, bankB, shA, shB, turn, to_move = st
         own = bankA if to_move == 0 else bankB
         return self.ACT[min(8, base(turn) + own)]
 
     def transition(self, st, act):
-        hA, hB, bankA, bankB, shA, shB, stA, stB, turn, to_move = st
+        hA, hB, bankA, bankB, shA, shB, turn, to_move = st
         a, d, b = act
         if to_move == 0:
             landed = max(0, a - shB)
             if landed:
                 hB = max(0, hB - landed)
-            stA = 0 if a else stA + 1
-            return (hA, hB, min(4, b), bankB, d, 0, stA, stB, turn + 1, 1)
+            return (hA, hB, min(4, b), bankB, d, 0, turn + 1, 1)
         landed = max(0, a - shA)
         if landed:
             hA = max(0, hA - landed)
-        stB = 0 if a else stB + 1
-        return (hA, hB, bankA, min(4, b), 0, d, stA, stB, turn + 1, 0)
+        return (hA, hB, bankA, min(4, b), 0, d, turn + 1, 0)
 
     def terminal(self, st):
-        hA, hB, bankA, bankB, shA, shB, stA, stB, turn, to_move = st
+        hA, hB, bankA, bankB, shA, shB, turn, to_move = st
         if hA <= 0:
             return -1.0
         if hB <= 0:
@@ -133,10 +132,10 @@ class Solver:
         return None
 
     def info_key(self, st):
-        hA, hB, bankA, bankB, shA, shB, stA, stB, turn, to_move = st
+        hA, hB, bankA, bankB, shA, shB, turn, to_move = st
         if to_move == 0:
-            return (turn, hA, hB, 0, bankA, shB + bankB, stA, stB)
-        return (turn, hA, hB, 1, bankB, shA + bankA, stB, stA)
+            return (turn, hA, hB, 0, bankA, shB + bankB)
+        return (turn, hA, hB, 1, bankB, shA + bankA)
 
     # ------------------------------------------------------------------ graph
     def _build_graph(self):
@@ -180,7 +179,7 @@ class Solver:
         self.is_term = np.array([t is not None for t in self.term], dtype=bool)
         self.term_arr = np.array([t if t is not None else 0.0
                                   for t in self.term], dtype=np.float64)
-        self.to_move = np.array([st[9] for st in self.states], dtype=np.int32)
+        self.to_move = np.array([st[7] for st in self.states], dtype=np.int32)
         # info sets: only for acting (non-terminal) states
         self.info_list = []
         self.info_to_id = {}
@@ -473,7 +472,7 @@ class Solver:
             if self.term[i] is not None or not self.children[i]:
                 continue
             info = self.info_of[i]
-            if self.states[i][9] == opp and info not in opp_sig:
+            if self.states[i][7] == opp and info not in opp_sig:
                 opp_sig[info] = self.average_strategy(info)
         br = [0.0] * len(self.states)
         for i in range(len(self.states) - 1, -1, -1):
@@ -485,7 +484,7 @@ class Solver:
             if not self.children[i]:
                 br[i] = 0.0
                 continue
-            if st[9] == br_player:
+            if st[7] == br_player:
                 br[i] = max(br[j] for j in self.children[i])
             else:
                 sig = opp_sig[self.info_of[i]]
@@ -514,14 +513,14 @@ class Solver:
             if self.term[i] is not None:
                 continue
             info = self.info_of[i]
-            if st[9] == opp and info not in opp_sig:
+            if st[7] == opp and info not in opp_sig:
                 opp_sig[info] = self.average_strategy(info)
         opp_reach = np.zeros(n)
         opp_reach[self.roots_arr] = self.root_w
         for i in range(n):
             if self.term[i] is not None or not self.children[i]:
                 continue
-            if self.states[i][9] == opp:
+            if self.states[i][7] == opp:
                 sig = opp_sig[self.info_of[i]]
                 for j, ci in enumerate(self.children[i]):
                     opp_reach[ci] += opp_reach[i] * sig[j]
@@ -532,7 +531,7 @@ class Solver:
         for i, st in enumerate(self.states):
             if self.term[i] is not None or not self.children[i]:
                 continue
-            if st[9] == br_player:
+            if st[7] == br_player:
                 br_groups.setdefault(self.info_of[i], []).append(i)
         v = np.zeros(n)
         for i in range(n):
@@ -544,7 +543,7 @@ class Solver:
             for i in range(n - 1, -1, -1):
                 if self.term[i] is not None or not self.children[i]:
                     continue
-                if self.states[i][9] == opp:
+                if self.states[i][7] == opp:
                     sig = opp_sig[self.info_of[i]]
                     nv = self.gamma * sum(sig[j] * v[ci]
                                           for j, ci in enumerate(self.children[i]))
