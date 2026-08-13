@@ -448,6 +448,13 @@ current active, and never recommends a strictly worse switch.
   not help a single run). Cost: the tree is much larger than the DAG (cap=6:
   ~5.1M nodes vs ~7.8k states); cap=7 (~100M) is beyond 64 GB.
   `server/run_full_history.py` trains it with checkpoints for resume.
+  Both solvers accept `first_move` (0 = A acts first, 1 = B first; only A-first
+  was supported originally) and explicit `start_states` (arbitrary mid-game
+  positions with banks/shields set, for subgame starts in the 2v2/3v3
+  hierarchy; `turn_cap` becomes max start turn + cap).
+  `server/run_table.py` farms a grid of matchups × first_move across workers
+  (each job is one independent solve; ~2-4 GB per cap=6 job) and can dump the
+  per-state equilibrium value table (continuation values for the hierarchy).
 - `match_1v1.py` runs solver-vs-bot matches (1v1, both seats, W/L/D).
 - `botvbot.py` is a bot-vs-bot A/B driver (agent v3 vs the frozen v2 baseline);
   `bot_selfplay.py` plays the current bot against itself (both seats, depth 1)

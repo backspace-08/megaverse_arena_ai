@@ -60,7 +60,8 @@ def actions_for(budget):
 class Solver:
     def __init__(self, typeA, typeB, atkA, atkB, hpA, hpB,
                  cap=20, stall_cap=3, start_turn=1, opp_remainder=0,
-                 root_weights=None, cfr_plus=True, dtype=np.float32,
+                 first_move=0, start_states=None, root_weights=None,
+                 cfr_plus=True, dtype=np.float32,
                  gamma=1.0, full_history=False):
         self.full_history = full_history
         self.typeA, self.typeB = typeA, typeB
@@ -74,17 +75,35 @@ class Solver:
         self.hB0 = max(1, ceil(hpB / self.dA)) if hpB else 0
         self.cap = cap
         self.stall_cap = stall_cap
-        self.turn_cap = start_turn + cap
         self.cfr_plus = cfr_plus
         self.dtype = dtype
         self.gamma = gamma
         self._t = 0
-        self.start_root = (self.hA0, self.hB0, 0, 0, 0, 0, start_turn, 0)
-        self.start_states = [
-            (self.hA0, self.hB0, 0, bankB, 0, shB, start_turn, 0)
-            for shB in range(opp_remainder + 1)
-            for bankB in (opp_remainder - shB,)
-        ]
+        # start states: either explicit (mid-game position) or built from
+        # first_move / opp_remainder (clean start at start_turn).
+        if start_states is not None:
+            self.start_states = [tuple(st) for st in start_states]
+            base_turn = max(st[6] for st in self.start_states)
+        else:
+            first_move = int(first_move)
+            if first_move == 0:
+                # A acts first; B's hidden remainder is opp_remainder.
+                self.start_states = [
+                    (self.hA0, self.hB0, 0, bankB, 0, shB, start_turn, 0)
+                    for shB in range(opp_remainder + 1)
+                    for bankB in (opp_remainder - shB,)
+                ]
+            else:
+                # B acts first; A's hidden remainder is opp_remainder.
+                self.start_states = [
+                    (self.hA0, self.hB0, bankA, 0, shA, 0, start_turn, 1)
+                    for shA in range(opp_remainder + 1)
+                    for bankA in (opp_remainder - shA,)
+                ]
+            base_turn = start_turn
+        self.turn_cap = base_turn + cap
+        self.start_root = self.start_states[0] if self.start_states else \
+            (self.hA0, self.hB0, 0, 0, 0, 0, start_turn, 0)
         self.root_weights = root_weights or [1.0] * len(self.start_states)
         self.ACT = {b: actions_for(b) for b in range(0, 9)}
         self.value = {}
@@ -147,8 +166,8 @@ class Solver:
             self.states.append(st)
             self.term.append(self.terminal(st))
             queue.append(len(self.states) - 1)
-        self.children = [[]]
-        self.parent = [-1]
+        self.children = [[] for _ in self.start_states]
+        self.parent = [-1] * len(self.start_states)
         while queue:
             i = queue.popleft()
             st = self.states[i]
