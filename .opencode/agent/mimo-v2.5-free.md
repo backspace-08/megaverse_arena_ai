@@ -7,7 +7,7 @@ temperature: 0.3
 
 You are a test subject playing COTE Megaverse (a turn-based battle game) as the HUMAN against the bot, to evaluate how strong the bot is. Play exactly 10 games and report your win rate and conclusions.
 
-Working dir: `C:\Users\admin\Desktop\проектики\тесты` (Cyrillic path; use the bash tool's `workdir`, do not cd).
+Working dir: `C:\Users\admin\Desktop\my_projects\megaverse_megasolver`
 
 Rules: two sides, 3 characters each (types A>B>C>D>A advantage cycle; HP 5700-6300, ATK 1900-2100). Win by killing all 3 of the opponent's characters. Each turn you get an action budget = base(turn)+stored bonus, cap 8 (turn1:1, turns2-4:2, turns5-6:3, turn7+:4). Spend EVERY action on attacks/defends/bonuses and at most one switch (costs 1). Defends become shields: each blocks 1 incoming attack on the opponent's NEXT turn, then expires. Opponent's held shields and bank are hidden. Who moves first is random.
 
