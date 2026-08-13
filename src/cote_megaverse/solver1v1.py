@@ -128,10 +128,6 @@ class Solver:
             return -1.0
         if hB <= 0:
             return 1.0
-        if to_move == 0 and stA >= self.stall_cap:
-            return -1.0
-        if to_move == 1 and stB >= self.stall_cap:
-            return 1.0
         if turn > self.turn_cap:
             return 0.0
         return None
