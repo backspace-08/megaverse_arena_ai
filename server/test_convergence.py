@@ -11,12 +11,17 @@ Usage (Linux, fork-based):
 The cap=12 run (~97 min on 1 core) answers "more iterations or structural bug?"
 The cap=16 run (~4.5 h) checks the "iterations per infoset" density hypothesis
 (0.1017 * 83103 ~= 8450).
+Single worker, but pin BLAS threads to 1 so the shared core is fully ours.
 """
 import argparse
 import os
 import pickle
 import sys
 import time
+
+for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+             "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+    os.environ.setdefault(_var, "1")
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 

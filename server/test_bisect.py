@@ -6,12 +6,17 @@ smoothly (pure scaling) or jumps at some cap (structural threshold, e.g. a
 TURN_ACTIONS/stall edge case).
 
 Runs caps in parallel via fork (Linux). ~20-30 min total on 32 vCPU.
+Each worker must stay on ONE core: pin BLAS thread counts to 1 before numpy.
 """
 import argparse
 import os
 import sys
 import time
 from multiprocessing import Pool
+
+for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+             "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+    os.environ.setdefault(_var, "1")
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
