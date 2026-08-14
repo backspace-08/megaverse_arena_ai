@@ -36,6 +36,32 @@ _NET = None  # optional value network for leaves, set by the Pool initializer
 ATK_POOL = (1900, 2000, 2100)
 
 
+def avail_mem_mb():
+    """Available physical RAM (MB) via Windows API; -1 if unavailable."""
+    try:
+        import ctypes
+
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        m = MEMORYSTATUSEX()
+        m.dwLength = ctypes.sizeof(m)
+        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))
+        return int(m.ullAvailPhys // (1024 * 1024))
+    except Exception:
+        return -1
+
+
 def _init_worker(net_path):
     global _NET
     if net_path:
@@ -46,14 +72,29 @@ def _init_worker(net_path):
 
 
 def sample(rng, depth, cap):
-    na = rng.choice((2, 2, 3, 3, 3))
-    nb = rng.choice((2, 2, 3, 3, 3))
+    # Curriculum: ~50% of the data must be late-game (low-HP 1v1/2v2) positions
+    # where the depth-limited tree actually reaches a kill within the horizon,
+    # so the labels carry real +1/-1 ground truth instead of leaf heuristics.
+    endgame = rng.random() < 0.5
+    if endgame:
+        na = rng.choice((1, 1, 2, 2))
+        nb = rng.choice((1, 1, 2, 2))
+    else:
+        na = rng.choice((2, 2, 3, 3, 3))
+        nb = rng.choice((2, 2, 3, 3, 3))
     team_a = [(rng.randrange(4), rng.choice(ATK_POOL), 600) for _ in range(na)]
     team_b = [(rng.randrange(4), rng.choice(ATK_POOL), 600) for _ in range(nb)]
     order_a = list(range(na))
     order_b = list(range(nb))
-    hp_a = [rng.randint(10, 600) for _ in range(na)]
-    hp_b = [rng.randint(10, 600) for _ in range(nb)]
+    if endgame:
+        # active at 1-2 hits (10..400 units), bench moderate
+        hp_a = [rng.randint(10, 400) if i == 0 else rng.randint(50, 600)
+                for i in range(na)]
+        hp_b = [rng.randint(10, 400) if i == 0 else rng.randint(50, 600)
+                for i in range(nb)]
+    else:
+        hp_a = [rng.randint(10, 600) for _ in range(na)]
+        hp_b = [rng.randint(10, 600) for _ in range(nb)]
     turn = rng.randint(2, 5)
     to_move = rng.randint(0, 1)  # symmetric: either side can be acting
     r_opp = rng.randint(0, 4)    # hidden split sum of the OPPONENT
@@ -123,14 +164,21 @@ def main():
     os.makedirs(os.path.dirname(a.out), exist_ok=True)
 
     t0 = time.time()
+    t_last, last_i = t0, 0
     tasks = [(a.seed * 1000 + i, a.depth, a.cap) for i in range(a.n)]
     with Pool(a.workers, initializer=_init_worker, initargs=(a.net,)) as pool:
         rows = []
         for i, row in enumerate(pool.imap_unordered(_worker, tasks)):
             rows.append(row)
-            if (i + 1) % 50 == 0 or i + 1 == a.n:
-                print(f"  {i + 1}/{a.n} pos "
-                      f"({(time.time() - t0) / (i + 1):.2f}s/pos)", flush=True)
+            k = i + 1
+            if k % 25 == 0 or k == a.n:
+                t_now = time.time()
+                inst = (t_now - t_last) / (k - last_i)
+                avg = (t_now - t0) / k
+                print(f"  {k}/{a.n} inst={inst:.2f}s/pos avg={avg:.2f}s/pos "
+                      f"availRAM={avail_mem_mb()}MB ({t_now - t0:.0f}s)",
+                      flush=True)
+                t_last, last_i = t_now, k
     dt = time.time() - t0
     values = [r["value"] for r in rows]
     with open(a.out, "wb") as fh:
