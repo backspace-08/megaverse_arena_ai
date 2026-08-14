@@ -123,6 +123,8 @@ class ValueLeaf:
 
     def override(self, team_a, team_b, leaf_states, bot_belief, bot_side,
                  batch=512):
+        if not leaf_states:
+            return []
         import numpy as np
         x = []
         keys = []

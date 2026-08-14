@@ -32,29 +32,35 @@ def run_match(seed, new_first, cfr_depth, cfr_iters, cfr_cap,
     value_leaf = None
     if net:
         from server.value_leaf import ValueLeaf
-        value_leaf = ValueLeaf(net, bot_side=0)
+        value_leaf = ValueLeaf(net)
     cfr = CFRBot(depth=cfr_depth, iters=cfr_iters, cap=cfr_cap,
                  value_leaf=value_leaf)
     pl = Planner(depth=pl_depth, max_nodes=pl_max_nodes)
-    for _ in range(80):
-        if state.player.lost or state.opponent.lost:
-            break
-        if state.player_to_move:
-            before = state
-            planning = GameState(state.player, state.opponent, state.turn, True)
-            move = cfr.choose(planning)
-            state = apply(state, move)
-            pl.observe(move.attacks, move.bonuses, move.switch,
-                       budget=before.player.actions)
-            pl.observe_shields(before.player.shields)
-        else:
-            before = state
-            planning = GameState(state.opponent, state.player, state.turn, True)
-            move = pl.choose(planning)
-            state = apply(state, move)
-            cfr.observe(move.attacks, move.bonuses, move.switch,
-                        budget=before.opponent.actions)
-            cfr.observe_shields(before.opponent.shields)
+    try:
+        for _ in range(80):
+            if state.player.lost or state.opponent.lost:
+                break
+            if state.player_to_move:
+                before = state
+                planning = GameState(state.player, state.opponent, state.turn, True)
+                move = cfr.choose(planning)
+                state = apply(state, move)
+                pl.observe(move.attacks, move.bonuses, move.switch,
+                           budget=before.player.actions)
+                pl.observe_shields(before.player.shields)
+            else:
+                before = state
+                planning = GameState(state.opponent, state.player, state.turn, True)
+                move = pl.choose(planning)
+                state = apply(state, move)
+                cfr.observe(move.attacks, move.bonuses, move.switch,
+                            budget=before.opponent.actions)
+                cfr.observe_shields(before.opponent.shields)
+    except Exception:
+        import traceback
+        with open(os.path.join(BASE, "table_out", "worker_err.log"), "w") as fh:
+            traceback.print_exc(file=fh)
+        raise
     if state.opponent.lost:
         return {"seed": seed, "new_first": new_first, "winner": "LEFT"}
     if state.player.lost:
