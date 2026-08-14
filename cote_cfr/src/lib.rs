@@ -329,9 +329,9 @@ struct MicroSolver {
     actions_of: Vec<Vec<Action>>,
     children: Vec<Vec<usize>>,
     info_id: Vec<usize>,
-    hist_a: Vec<Vec<Vec<i32>>>,
-    hist_b: Vec<Vec<Vec<i32>>>,
+    parent: Vec<usize>,
     infos: Vec<InfoSet>,
+    tm_of: Vec<u8>,
     r_a: Vec<f64>,
     r_b: Vec<f64>,
     v: Vec<f64>,
@@ -353,9 +353,9 @@ impl MicroSolver {
             actions_of: Vec::new(),
             children: Vec::new(),
             info_id: Vec::new(),
-            hist_a: Vec::new(),
-            hist_b: Vec::new(),
+            parent: Vec::new(),
             infos: Vec::new(),
+            tm_of: Vec::new(),
             r_a: Vec::new(),
             r_b: Vec::new(),
             v: Vec::new(),
@@ -367,8 +367,8 @@ impl MicroSolver {
         s
     }
 
-    fn get_or_add_info(&mut self, map: &mut HashMap<(u8, Vec<Vec<i32>>), usize>, tm: u8, hist: &[Vec<i32>]) -> usize {
-        let key = (tm, hist.to_vec());
+    fn get_or_add_info(&mut self, map: &mut HashMap<(u8, Vec<i32>, usize), usize>, tm: u8, obs: &[i32], prev_iid: usize) -> usize {
+        let key = (tm, obs.to_vec(), prev_iid);
         if let Some(&id) = map.get(&key) {
             return id;
         }
@@ -382,26 +382,18 @@ impl MicroSolver {
     }
 
     fn build(&mut self, root_states: Vec<(State, f64)>) {
-        let mut info_map: HashMap<(u8, Vec<Vec<i32>>), usize> = HashMap::new();
+        let mut info_map: HashMap<(u8, Vec<i32>, usize), usize> = HashMap::new();
         let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
 
         for (root, w) in root_states {
             let ik = info_key_flat(&root);
-            let mut ha: Vec<Vec<i32>> = Vec::new();
-            let mut hb: Vec<Vec<i32>> = Vec::new();
-            if root.to_move == 0 {
-                ha.push(ik);
-            } else {
-                hb.push(ik);
-            }
             let i = self.states.len();
             self.roots.push((i, w));
             self.states.push(root.clone());
             self.terminals.push(self.trunk.terminal(&root));
             self.depths.push(0);
-            self.hist_a.push(ha.clone());
-            self.hist_b.push(hb.clone());
-            let iid = self.get_or_add_info(&mut info_map, root.to_move as u8, if root.to_move == 0 { &ha } else { &hb });
+            self.parent.push(usize::MAX);
+            let iid = self.get_or_add_info(&mut info_map, root.to_move as u8, &ik, 0);
             self.info_id.push(iid);
             self.actions_of.push(Vec::new());
             self.children.push(Vec::new());
@@ -417,26 +409,18 @@ impl MicroSolver {
             self.actions_of[i] = acts.clone();
             for act in acts {
                 if let Some(child) = self.trunk.transition(&self.states[i], &act) {
-                    let mut cha = self.hist_a[i].clone();
-                    let mut chb = self.hist_b[i].clone();
                     let cik = info_key_flat(&child);
-                    if child.to_move == 0 {
-                        cha.push(cik);
-                    } else {
-                        chb.push(cik);
-                    }
                     let cid = self.states.len();
                     self.states.push(child.clone());
                     self.terminals.push(self.trunk.terminal(&child));
                     self.depths.push(self.depths[i] + 1);
-                    self.hist_a.push(cha);
-                    self.hist_b.push(chb);
-                    let chist = if child.to_move == 0 {
-                        self.hist_a[cid].clone()
-                    } else {
-                        self.hist_b[cid].clone()
-                    };
-                    let ciid = self.get_or_add_info(&mut info_map, child.to_move as u8, &chist);
+                    // perfect recall via (obs, prev_iid): prev_iid is the acting
+                    // player's previous own info set (the depth-2 ancestor, since
+                    // turns strictly alternate). By induction it encodes the full
+                    // prior observation sequence.
+                    let prev_iid = if self.depths[i] >= 1 { self.info_id[self.parent[i]] } else { 0 };
+                    self.parent.push(i);
+                    let ciid = self.get_or_add_info(&mut info_map, child.to_move as u8, &cik, prev_iid);
                     self.info_id.push(ciid);
                     self.children[i].push(cid);
                     self.actions_of.push(Vec::new());
@@ -452,17 +436,19 @@ impl MicroSolver {
             }
         }
 
-        // finalize info sets: n_acts from the first node, allocate arrays
+        // finalize info sets: n_acts and to_move from the first node (single O(n) pass),
+        // then allocate arrays
         let n = self.states.len();
-        for iid in 0..self.infos.len() {
-            let mut na = 0;
-            for i in 0..n {
-                if self.info_id[i] == iid {
-                    na = self.actions_of[i].len();
-                    break;
-                }
+        self.tm_of = vec![255; self.infos.len()];
+        for i in 0..n {
+            let iid = self.info_id[i];
+            if self.tm_of[iid] == 255 {
+                self.tm_of[iid] = self.states[i].to_move as u8;
+                self.infos[iid].n_acts = self.actions_of[i].len();
             }
-            self.infos[iid].n_acts = na;
+        }
+        for iid in 0..self.infos.len() {
+            let na = self.infos[iid].n_acts;
             self.infos[iid].regret = vec![0.0; na];
             self.infos[iid].avg = vec![0.0; na];
         }
@@ -624,13 +610,7 @@ impl MicroSolver {
     }
 
     fn a_move_of_info(&self, iid: usize) -> bool {
-        // A's info sets have to_move == 0 at their nodes
-        for i in 0..self.states.len() {
-            if self.info_id[i] == iid {
-                return self.states[i].to_move == 0;
-            }
-        }
-        true
+        self.tm_of[iid] == 0
     }
 
     fn root_strategy(&self) -> (Vec<f64>, f64) {
@@ -782,6 +762,23 @@ fn solve_micro_belief(
     solve_micro_impl(team_a, team_b, states, depth, iters, gamma, cap, start_turn)
 }
 
+/// Build the micro-tree without iterating; returns (n_nodes, n_infos).
+#[pyfunction]
+#[pyo3(signature = (team_a, team_b, state, depth=4, cap=20, start_turn=1))]
+fn micro_stats(
+    team_a: Vec<(u8, i32, i32)>,
+    team_b: Vec<(u8, i32, i32)>,
+    state: Vec<i32>,
+    depth: u8,
+    cap: i32,
+    start_turn: i32,
+) -> PyResult<(usize, usize)> {
+    let root = decode_state(&state)?;
+    let trunk = Trunk::new(team_a, team_b, cap, start_turn);
+    let solver = MicroSolver::new(trunk, vec![(root, 1.0)], depth, 0.995);
+    Ok((solver.states.len(), solver.infos.len()))
+}
+
 #[pyfunction]
 fn load_1v1_table(path: String) -> PyResult<usize> {
     let text = std::fs::read_to_string(&path)
@@ -822,6 +819,7 @@ fn _cote_cfr(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTrunk>()?;
     m.add_function(wrap_pyfunction!(solve_micro, m)?)?;
     m.add_function(wrap_pyfunction!(solve_micro_belief, m)?)?;
+    m.add_function(wrap_pyfunction!(micro_stats, m)?)?;
     m.add_function(wrap_pyfunction!(load_1v1_table, m)?)?;
     Ok(())
 }
