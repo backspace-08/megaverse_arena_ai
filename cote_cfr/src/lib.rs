@@ -322,6 +322,7 @@ struct MicroSolver {
     trunk: Trunk,
     depth: u8,
     gamma: f64,
+    root_states: Vec<(State, f64)>,
     roots: Vec<(usize, f64)>,
     states: Vec<State>,
     terminals: Vec<Option<f64>>,
@@ -330,8 +331,10 @@ struct MicroSolver {
     children: Vec<Vec<usize>>,
     info_id: Vec<usize>,
     parent: Vec<usize>,
+    full_key: Vec<Vec<i32>>,
     infos: Vec<InfoSet>,
     tm_of: Vec<u8>,
+    keep: HashMap<(u8, Vec<i32>), Vec<bool>>,
     r_a: Vec<f64>,
     r_b: Vec<f64>,
     v: Vec<f64>,
@@ -346,6 +349,7 @@ impl MicroSolver {
             trunk,
             depth,
             gamma,
+            root_states,
             roots: Vec::new(),
             states: Vec::new(),
             terminals: Vec::new(),
@@ -354,8 +358,10 @@ impl MicroSolver {
             children: Vec::new(),
             info_id: Vec::new(),
             parent: Vec::new(),
+            full_key: Vec::new(),
             infos: Vec::new(),
             tm_of: Vec::new(),
+            keep: HashMap::new(),
             r_a: Vec::new(),
             r_b: Vec::new(),
             v: Vec::new(),
@@ -363,28 +369,26 @@ impl MicroSolver {
             reach_self_sum: Vec::new(),
             cfv_contrib: Vec::new(),
         };
-        s.build(root_states);
+        s.build();
         s
     }
 
-    fn get_or_add_info(&mut self, map: &mut HashMap<(u8, Vec<i32>, usize), usize>, tm: u8, obs: &[i32], prev_iid: usize) -> usize {
-        let key = (tm, obs.to_vec(), prev_iid);
+    fn get_or_add_info(&mut self, map: &mut HashMap<(u8, Vec<i32>), usize>, tm: u8, full: &[i32]) -> usize {
+        let key = (tm, full.to_vec());
         if let Some(&id) = map.get(&key) {
             return id;
         }
-        // actions count = the number of actions at the (first) node with this info.
-        // We fill it lazily after the build by sampling a node. For the map we only
-        // need the id; n_acts is patched in finalize().
         let id = self.infos.len();
         self.infos.push(InfoSet { n_acts: 0, regret: Vec::new(), avg: Vec::new() });
         map.insert(key, id);
         id
     }
 
-    fn build(&mut self, root_states: Vec<(State, f64)>) {
-        let mut info_map: HashMap<(u8, Vec<i32>, usize), usize> = HashMap::new();
+    fn build(&mut self) {
+        let mut info_map: HashMap<(u8, Vec<i32>), usize> = HashMap::new();
         let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
 
+        let root_states = self.root_states.iter().cloned().collect::<Vec<_>>();
         for (root, w) in root_states {
             let ik = info_key_flat(&root);
             let i = self.states.len();
@@ -393,7 +397,8 @@ impl MicroSolver {
             self.terminals.push(self.trunk.terminal(&root));
             self.depths.push(0);
             self.parent.push(usize::MAX);
-            let iid = self.get_or_add_info(&mut info_map, root.to_move as u8, &ik, 0);
+            self.full_key.push(ik.clone());
+            let iid = self.get_or_add_info(&mut info_map, root.to_move as u8, &ik);
             self.info_id.push(iid);
             self.actions_of.push(Vec::new());
             self.children.push(Vec::new());
@@ -404,8 +409,16 @@ impl MicroSolver {
             if self.terminals[i].is_some() || self.depths[i] >= self.depth {
                 continue;
             }
-            let acts = self.trunk.actions(&self.states[i]);
-            let n_acts = acts.len();
+            let key = (self.states[i].to_move as u8, self.full_key[i].clone());
+            let mut acts = self.trunk.actions(&self.states[i]);
+            if let Some(mask) = self.keep.get(&key) {
+                acts = acts
+                    .into_iter()
+                    .zip(mask.iter())
+                    .filter(|(_, &k)| k)
+                    .map(|(a, _)| a)
+                    .collect();
+            }
             self.actions_of[i] = acts.clone();
             for act in acts {
                 if let Some(child) = self.trunk.transition(&self.states[i], &act) {
@@ -414,25 +427,25 @@ impl MicroSolver {
                     self.states.push(child.clone());
                     self.terminals.push(self.trunk.terminal(&child));
                     self.depths.push(self.depths[i] + 1);
-                    // perfect recall via (obs, prev_iid): prev_iid is the acting
-                    // player's previous own info set (the depth-2 ancestor, since
-                    // turns strictly alternate). By induction it encodes the full
-                    // prior observation sequence.
-                    let prev_iid = if self.depths[i] >= 1 { self.info_id[self.parent[i]] } else { 0 };
+                    // Perfect recall: the info set is the acting player's full
+                    // observation sequence. Incrementally extend the previous
+                    // own sequence (the depth-2 ancestor, since turns strictly
+                    // alternate) with the current observation.
+                    let mut fk = if self.depths[i] >= 1 {
+                        self.full_key[self.parent[i]].clone()
+                    } else {
+                        Vec::new()
+                    };
+                    fk.extend_from_slice(&cik);
                     self.parent.push(i);
-                    let ciid = self.get_or_add_info(&mut info_map, child.to_move as u8, &cik, prev_iid);
+                    self.full_key.push(fk.clone());
+                    let ciid = self.get_or_add_info(&mut info_map, child.to_move as u8, &fk);
                     self.info_id.push(ciid);
                     self.children[i].push(cid);
                     self.actions_of.push(Vec::new());
                     self.children.push(Vec::new());
                     queue.push_back(cid);
                 }
-            }
-            // actions_of[i] is set; children[i] parallels the actions (only valid transitions).
-            if n_acts != self.children[i].len() {
-                // some transitions returned None (shouldn't happen: wipe returns empty order).
-                // keep children parallel to actions by padding with a self-loop? We disallow None.
-                // (trunk.transition returns Some always; wipe -> empty order, terminal).
             }
         }
 
@@ -629,6 +642,102 @@ impl MicroSolver {
         }
         (probs, value)
     }
+
+    fn rebuild(&mut self) {
+        self.roots.clear();
+        self.states.clear();
+        self.terminals.clear();
+        self.depths.clear();
+        self.actions_of.clear();
+        self.children.clear();
+        self.info_id.clear();
+        self.parent.clear();
+        self.full_key.clear();
+        self.infos.clear();
+        self.tm_of.clear();
+        self.r_a.clear();
+        self.r_b.clear();
+        self.v.clear();
+        self.reach_opp_sum.clear();
+        self.reach_self_sum.clear();
+        self.cfv_contrib.clear();
+        self.build();
+    }
+
+    /// Keep only the actions the average strategy actually plays, at most
+    /// max_acts per info set: always keep the top `always_keep` actions, plus
+    /// any action with weight >= eps. Returns true if any info set changed.
+    fn prune_support(&mut self, eps: f64, max_acts: usize, always_keep: usize) -> bool {
+        let mut changed = false;
+        let mut seen = vec![false; self.infos.len()];
+        for i in 0..self.states.len() {
+            let iid = self.info_id[i];
+            if seen[iid] {
+                continue;
+            }
+            seen[iid] = true;
+            let na = self.infos[iid].n_acts;
+            if na == 0 {
+                continue;
+            }
+            let avg = &self.infos[iid].avg;
+            let total: f64 = avg.iter().sum();
+            let mut w: Vec<(f64, usize)> = if total > 0.0 {
+                avg.iter().enumerate().map(|(a, &x)| (x / total, a)).collect()
+            } else {
+                (0..na).map(|a| (1.0 / na as f64, a)).collect()
+            };
+            w.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+            let mut mask = vec![false; na];
+            let mut kept = 0usize;
+            for &(weight, a) in &w {
+                if kept >= max_acts {
+                    break;
+                }
+                if kept < always_keep || weight >= eps {
+                    mask[a] = true;
+                    kept += 1;
+                }
+            }
+            let key = (self.tm_of[iid] as u8, self.full_key[i].clone());
+            if let Some(old) = self.keep.get(&key) {
+                if *old != mask {
+                    changed = true;
+                }
+            } else {
+                changed = true;
+            }
+            self.keep.insert(key, mask);
+        }
+        changed
+    }
+
+    /// CFR loop: burn-in on the full tree, then prune+rebuild rounds that
+    /// concentrate the tree on the strategy support, refining each round.
+    fn run(&mut self, iters: usize, burn_in: usize, eps: f64, max_acts: usize, always_keep: usize) {
+        let burn = burn_in.min(iters);
+        for _ in 0..burn {
+            self.iterate();
+        }
+        let mut remaining = iters - burn;
+        for round in 0..3 {
+            if remaining == 0 {
+                break;
+            }
+            if !self.prune_support(eps, max_acts, always_keep) {
+                break;
+            }
+            self.rebuild();
+            let per = (remaining / (3 - round)).max(1);
+            for _ in 0..per {
+                self.iterate();
+            }
+            remaining -= per;
+        }
+        for _ in 0..remaining {
+            self.iterate();
+        }
+    }
 }
 
 // ------------------------------------------------------------------ PyO3
@@ -697,6 +806,7 @@ fn solve_micro_impl(
     gamma: f64,
     cap: i32,
     start_turn: i32,
+    prune: bool,
 ) -> PyResult<(Vec<Vec<i32>>, Vec<f64>, f64)> {
     let mut roots = Vec::with_capacity(root_states.len());
     let mut wsum = 0.0;
@@ -715,8 +825,15 @@ fn solve_micro_impl(
     }
     let trunk = Trunk::new(team_a, team_b, cap, start_turn);
     let mut solver = MicroSolver::new(trunk, roots, depth, gamma);
-    for _ in 0..iters {
-        solver.iterate();
+    if prune {
+        // Burn-in on the full tree long enough for the strategy support to
+        // mature before pruning. NOTE: on depth-3+ trees this needs thousands
+        // of iterations to be safe; the default (prune=false) runs the full
+        // tree for all iterations instead.
+        let burn_in = ((iters / 2).max(40)).min(iters);
+        solver.run(iters, burn_in, 0.001, 10, 4);
+    } else {
+        solver.run(iters, iters, 0.001, 10, 4);
     }
     let acts = &solver.actions_of[solver.roots[0].0];
     let (probs, value) = solver.root_strategy();
@@ -728,7 +845,7 @@ fn solve_micro_impl(
 }
 
 #[pyfunction]
-#[pyo3(signature = (team_a, team_b, state, depth=4, iters=500, gamma=0.995, cap=20, start_turn=1))]
+#[pyo3(signature = (team_a, team_b, state, depth=4, iters=500, gamma=0.995, cap=20, start_turn=1, prune=false))]
 #[allow(clippy::too_many_arguments)]
 fn solve_micro(
     team_a: Vec<(u8, i32, i32)>,
@@ -739,15 +856,16 @@ fn solve_micro(
     gamma: f64,
     cap: i32,
     start_turn: i32,
+    prune: bool,
 ) -> PyResult<(Vec<Vec<i32>>, Vec<f64>, f64)> {
-    solve_micro_impl(team_a, team_b, vec![(state, 1.0)], depth, iters, gamma, cap, start_turn)
+    solve_micro_impl(team_a, team_b, vec![(state, 1.0)], depth, iters, gamma, cap, start_turn, prune)
 }
 
 /// Belief-weighted root: the acting player's info set is shared across all root
 /// states (same public observation), the opponent's "reach" into each is the
 /// belief weight. The returned value is the belief-weighted average.
 #[pyfunction]
-#[pyo3(signature = (team_a, team_b, states, depth=4, iters=500, gamma=0.995, cap=20, start_turn=1))]
+#[pyo3(signature = (team_a, team_b, states, depth=4, iters=500, gamma=0.995, cap=20, start_turn=1, prune=false))]
 #[allow(clippy::too_many_arguments)]
 fn solve_micro_belief(
     team_a: Vec<(u8, i32, i32)>,
@@ -758,8 +876,9 @@ fn solve_micro_belief(
     gamma: f64,
     cap: i32,
     start_turn: i32,
+    prune: bool,
 ) -> PyResult<(Vec<Vec<i32>>, Vec<f64>, f64)> {
-    solve_micro_impl(team_a, team_b, states, depth, iters, gamma, cap, start_turn)
+    solve_micro_impl(team_a, team_b, states, depth, iters, gamma, cap, start_turn, prune)
 }
 
 /// Build the micro-tree without iterating; returns (n_nodes, n_infos).
