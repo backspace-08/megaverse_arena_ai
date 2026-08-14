@@ -322,7 +322,7 @@ struct MicroSolver {
     trunk: Trunk,
     depth: u8,
     gamma: f64,
-    root: usize,
+    roots: Vec<(usize, f64)>,
     states: Vec<State>,
     terminals: Vec<Option<f64>>,
     depths: Vec<u8>,
@@ -341,12 +341,12 @@ struct MicroSolver {
 }
 
 impl MicroSolver {
-    fn new(trunk: Trunk, root_state: State, depth: u8, gamma: f64) -> Self {
+    fn new(trunk: Trunk, root_states: Vec<(State, f64)>, depth: u8, gamma: f64) -> Self {
         let mut s = MicroSolver {
             trunk,
             depth,
             gamma,
-            root: 0,
+            roots: Vec::new(),
             states: Vec::new(),
             terminals: Vec::new(),
             depths: Vec::new(),
@@ -363,7 +363,7 @@ impl MicroSolver {
             reach_self_sum: Vec::new(),
             cfv_contrib: Vec::new(),
         };
-        s.build(root_state);
+        s.build(root_states);
         s
     }
 
@@ -381,29 +381,32 @@ impl MicroSolver {
         id
     }
 
-    fn build(&mut self, root: State) {
+    fn build(&mut self, root_states: Vec<(State, f64)>) {
         let mut info_map: HashMap<(u8, Vec<Vec<i32>>), usize> = HashMap::new();
         let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
 
-        let ik = info_key_flat(&root);
-        let mut ha: Vec<Vec<i32>> = Vec::new();
-        let mut hb: Vec<Vec<i32>> = Vec::new();
-        if root.to_move == 0 {
-            ha.push(ik);
-        } else {
-            hb.push(ik);
+        for (root, w) in root_states {
+            let ik = info_key_flat(&root);
+            let mut ha: Vec<Vec<i32>> = Vec::new();
+            let mut hb: Vec<Vec<i32>> = Vec::new();
+            if root.to_move == 0 {
+                ha.push(ik);
+            } else {
+                hb.push(ik);
+            }
+            let i = self.states.len();
+            self.roots.push((i, w));
+            self.states.push(root.clone());
+            self.terminals.push(self.trunk.terminal(&root));
+            self.depths.push(0);
+            self.hist_a.push(ha.clone());
+            self.hist_b.push(hb.clone());
+            let iid = self.get_or_add_info(&mut info_map, root.to_move as u8, if root.to_move == 0 { &ha } else { &hb });
+            self.info_id.push(iid);
+            self.actions_of.push(Vec::new());
+            self.children.push(Vec::new());
+            queue.push_back(i);
         }
-        self.root = self.states.len();
-        self.states.push(root.clone());
-        self.terminals.push(self.trunk.terminal(&root));
-        self.depths.push(0);
-        self.hist_a.push(ha.clone());
-        self.hist_b.push(hb.clone());
-        let iid = self.get_or_add_info(&mut info_map, root.to_move as u8, if root.to_move == 0 { &ha } else { &hb });
-        self.info_id.push(iid);
-        self.actions_of.push(Vec::new());
-        self.children.push(Vec::new());
-        queue.push_back(self.root);
 
         while let Some(i) = queue.pop_front() {
             if self.terminals[i].is_some() || self.depths[i] >= self.depth {
@@ -538,8 +541,15 @@ impl MicroSolver {
         // reach
         self.r_a.fill(0.0);
         self.r_b.fill(0.0);
-        self.r_a[self.root] = 1.0;
-        self.r_b[self.root] = 1.0;
+        for &(ri, w) in &self.roots {
+            if self.states[ri].to_move == 0 {
+                self.r_a[ri] = 1.0;
+                self.r_b[ri] = w;
+            } else {
+                self.r_b[ri] = 1.0;
+                self.r_a[ri] = w;
+            }
+        }
         for i in 0..n {
             if self.terminals[i].is_some() || self.depths[i] >= self.depth {
                 continue;
@@ -624,7 +634,7 @@ impl MicroSolver {
     }
 
     fn root_strategy(&self) -> (Vec<f64>, f64) {
-        let iid = self.info_id[self.root];
+        let iid = self.info_id[self.roots[0].0];
         let na = self.infos[iid].n_acts;
         let avg = &self.infos[iid].avg;
         let total: f64 = avg.iter().sum();
@@ -633,7 +643,11 @@ impl MicroSolver {
         } else {
             vec![1.0 / na as f64; na]
         };
-        (probs, self.v[self.root])
+        let mut value = 0.0;
+        for &(ri, w) in &self.roots {
+            value += w * self.v[ri];
+        }
+        (probs, value)
     }
 }
 
@@ -694,6 +708,45 @@ impl PyTrunk {
     }
 }
 
+fn solve_micro_impl(
+    team_a: Vec<(u8, i32, i32)>,
+    team_b: Vec<(u8, i32, i32)>,
+    root_states: Vec<(Vec<i32>, f64)>,
+    depth: u8,
+    iters: usize,
+    gamma: f64,
+    cap: i32,
+    start_turn: i32,
+) -> PyResult<(Vec<Vec<i32>>, Vec<f64>, f64)> {
+    let mut roots = Vec::with_capacity(root_states.len());
+    let mut wsum = 0.0;
+    for (raw, w) in root_states {
+        roots.push((decode_state(&raw)?, w));
+        wsum += w;
+    }
+    if roots.is_empty() {
+        return Err(PyValueError::new_err("no root states"));
+    }
+    if wsum <= 0.0 {
+        return Err(PyValueError::new_err("root weights must sum to > 0"));
+    }
+    for (_, w) in roots.iter_mut() {
+        *w /= wsum;
+    }
+    let trunk = Trunk::new(team_a, team_b, cap, start_turn);
+    let mut solver = MicroSolver::new(trunk, roots, depth, gamma);
+    for _ in 0..iters {
+        solver.iterate();
+    }
+    let acts = &solver.actions_of[solver.roots[0].0];
+    let (probs, value) = solver.root_strategy();
+    let actions: Vec<Vec<i32>> = acts
+        .iter()
+        .map(|ac| vec![ac.a, ac.d, ac.b, ac.sw.map(|x| x as i32).unwrap_or(-1)])
+        .collect();
+    Ok((actions, probs, value))
+}
+
 #[pyfunction]
 #[pyo3(signature = (team_a, team_b, state, depth=4, iters=500, gamma=0.995, cap=20, start_turn=1))]
 #[allow(clippy::too_many_arguments)]
@@ -707,19 +760,26 @@ fn solve_micro(
     cap: i32,
     start_turn: i32,
 ) -> PyResult<(Vec<Vec<i32>>, Vec<f64>, f64)> {
-    let root = decode_state(&state)?;
-    let trunk = Trunk::new(team_a, team_b, cap, start_turn);
-    let mut solver = MicroSolver::new(trunk, root, depth, gamma);
-    for _ in 0..iters {
-        solver.iterate();
-    }
-    let acts = &solver.actions_of[solver.root];
-    let (probs, value) = solver.root_strategy();
-    let actions: Vec<Vec<i32>> = acts
-        .iter()
-        .map(|ac| vec![ac.a, ac.d, ac.b, ac.sw.map(|x| x as i32).unwrap_or(-1)])
-        .collect();
-    Ok((actions, probs, value))
+    solve_micro_impl(team_a, team_b, vec![(state, 1.0)], depth, iters, gamma, cap, start_turn)
+}
+
+/// Belief-weighted root: the acting player's info set is shared across all root
+/// states (same public observation), the opponent's "reach" into each is the
+/// belief weight. The returned value is the belief-weighted average.
+#[pyfunction]
+#[pyo3(signature = (team_a, team_b, states, depth=4, iters=500, gamma=0.995, cap=20, start_turn=1))]
+#[allow(clippy::too_many_arguments)]
+fn solve_micro_belief(
+    team_a: Vec<(u8, i32, i32)>,
+    team_b: Vec<(u8, i32, i32)>,
+    states: Vec<(Vec<i32>, f64)>,
+    depth: u8,
+    iters: usize,
+    gamma: f64,
+    cap: i32,
+    start_turn: i32,
+) -> PyResult<(Vec<Vec<i32>>, Vec<f64>, f64)> {
+    solve_micro_impl(team_a, team_b, states, depth, iters, gamma, cap, start_turn)
 }
 
 #[pyfunction]
@@ -761,6 +821,7 @@ fn load_1v1_table(path: String) -> PyResult<usize> {
 fn _cote_cfr(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTrunk>()?;
     m.add_function(wrap_pyfunction!(solve_micro, m)?)?;
+    m.add_function(wrap_pyfunction!(solve_micro_belief, m)?)?;
     m.add_function(wrap_pyfunction!(load_1v1_table, m)?)?;
     Ok(())
 }
