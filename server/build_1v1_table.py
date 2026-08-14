@@ -150,7 +150,7 @@ def run_phase4(pool, L, args, meta):
                               gamma=args.gamma, solve_iters=args.solve_iters)
         dt = time.time() - t0
         save_ckpt(args.ckpt_dir, "phase4", V)
-        write_meta(args.ckpt_dir, {"phase": "phase4", "iter": it})
+        write_meta(args.ckpt_dir, {"phase": "phase4", "iter": it, "layout": L})
         if per_iter is None:
             per_iter = dt
         eta = per_iter * (args.max_iters - it) / 60.0
@@ -161,7 +161,8 @@ def run_phase4(pool, L, args, meta):
             print("[phase4 converged at iter %d (delta<%.4f)]" % (it, args.tol), flush=True)
             break
     print("[phase4 done: %d iterations, %5.1fs total]" % (it, time.time() - t_all), flush=True)
-    write_meta(args.ckpt_dir, {"phase": "phase4", "phase4_done": True, "iters": it})
+    write_meta(args.ckpt_dir, {"phase": "phase4", "phase4_done": True, "iters": it,
+                               "layout": L})
     return V
 
 
@@ -178,7 +179,7 @@ def run_ramp(pool, L, args, phase4):
                           gamma=args.gamma, solve_iters=args.solve_iters)
         ramp[k] = V
         save_ckpt(args.ckpt_dir, "ramp%d" % k, V)
-        write_meta(args.ckpt_dir, {"phase": "ramp", "turn": k})
+        write_meta(args.ckpt_dir, {"phase": "ramp", "turn": k, "layout": L})
         print("[ramp turn %d] done in %.1fs" % (k, time.time() - t0), flush=True)
     return ramp
 
@@ -236,6 +237,10 @@ def main():
              L["r_max"], grid_size(L), args.workers), flush=True)
 
     meta = None if args.force else read_meta(args.ckpt_dir)
+    if meta is not None and meta.get("layout") != L:
+        print("[warn] checkpoint layout %s != requested %s; ignoring checkpoints"
+              % (meta.get("layout"), L), flush=True)
+        meta = None
     pool = Pool(args.workers)
     try:
         phase4 = run_phase4(pool, L, args, meta)

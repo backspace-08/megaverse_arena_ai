@@ -29,53 +29,82 @@
 Чекпоинты в `server/ckpt_1v1/` после каждой итерации фазы 4 и каждого хода
 рампы; при обрыве тот же запуск продолжает с последнего чекпоинта.
 
-## Пошагово (Ubuntu 22.04/24.04, всё внутри tmux)
+## Пошагово (Ubuntu 22.04 или 24.04, всё внутри tmux)
 
+### 1. База системы
 ```bash
-# 1. База
-sudo apt update && sudo apt install -y git curl build-essential python3 python3-pip python3-venv
+sudo apt update && sudo apt upgrade -y        # upgrade — обновить пакеты свежего VPS
+sudo apt install -y git curl build-essential python3 python3-pip python3-venv python3-dev
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source "$HOME/.cargo/env"
-python3 -m pip install --user maturin
+cargo --version        # проверить: должен печатать версию
+```
 
-# 2. Код
-git clone <ваш репозиторий> megaverse
+### 2. Виртуальное окружение Python (важно!)
+На Ubuntu 24.04 системный pip блокирует установку пакетов (PEP 668:
+`externally-managed-environment`). Поэтому ставим maturin и движок в venv:
+```bash
+cd ~
+python3 -m venv venv
+source venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install maturin
+```
+
+### 3. Код
+```bash
+cd ~
+git clone <URL вашего репозитория> megaverse
 cd megaverse
-git checkout <ветка/коммит с этим изменением>
+# убедиться, что мы на ветке/коммите с новым драйвером:
+git log --oneline -3
+```
 
-# 3. Сборка движка под сервер (AVX-512 / Ice Lake)
+### 4. Сборка движка под сервер (Ice Lake → AVX-512)
+```bash
 cd cote_cfr
 RUSTFLAGS="-C target-cpu=native" maturin build --release
-python3 -m pip install --user target/wheels/*.whl
+python -m pip install target/wheels/*.whl
 cd ..
-
-# 4. Запуск (в tmux, чтобы пережил обрыв SSH)
-tmux new -s solver
-python3 server/build_1v1_table.py --workers 56 --out cote_cfr/1v1_table.csv
+python -c "import _cote_cfr; print('engine ok')"   # проверить импорт
 ```
 
-Прогресс: каждая итерация печатает `delta`, горизонт, репрезентативные значения
-(свежий (5,5), (7,7), burst-ready) и ETA. Калибровка: первые 2-3 итерации —
-убедиться, что итерация ~< 2-3 мин; если нет — уменьшить `--workers`.
-
-При обрыве: перезайти, `tmux attach`, запустить ту же команду (подхватит чекпоинты).
-Форс-перезапуск: `--force`.
-
-## Выгрузка результата
-
+### 5. Калибровка (необязательно, но дёшево — ~2-4 мин)
+Малый грид (hits 1..8) на 2-3 итерации, чтобы измерить реальную скорость
+итерации и число воркеров ДО большого прогона (layout малого грида записан в
+чекпоинт, большой прогон его проигнорирует — путаницы нет):
 ```bash
-# в tmux после [done]:
-# проверить
-head -3 cote_cfr/1v1_table.csv
-du -h cote_cfr/1v1_table.csv
-
-# на ноуте:
-scp <user>@<host>:megaverse/cote_cfr/1v1_table.csv cote_cfr/1v1_table.csv
+tmux new -s calib
+python server/build_1v1_table.py --workers 56 --hits-max 8 --max-iters 2 \
+    --ckpt-dir server/ckpt_calib --out /tmp/calib.csv
+# смотрим на "[phase4 iter ...] iter= NN.Ns": это время полной итерации малого
+# грида (25% от полного). Полный грид будет ~4x. Если малый ~<60с — отлично.
 ```
 
-Затем удалить сервер в панели управления. Таблица кладётся в
-`cote_cfr/1v1_table.csv` (gitignored — это артефакт сборки) и подхватывается
-ботом автоматически.
+### 6. Основной прогон
+```bash
+tmux new -s solver
+python server/build_1v1_table.py --workers 56 --out cote_cfr/1v1_table.csv
+```
+- `--workers`: проверьте `nproc` (у Ice Lake-сервера обычно 64). 56 безопасно на 64GB.
+- Первые 2-3 итерации смотреть: `delta` должна убывать, `iter= NN.Ns` — время
+  итерации. Если итерация > ~3 мин — `Ctrl-C`, снизить `--workers` (например 32)
+  и запустить снова (подхватит чекпоинты, ничего не потеряется).
+- Обрыв SSH: перезайти, `tmux attach -t solver` — процесс жив.
+- Если процесс всё же упал: запустить ту же команду — resume с последнего чекпоинта.
+- Форс-перезапуск с нуля: `--force` (или `rm -rf server/ckpt_1v1`).
+
+### 7. Выгрузка результата
+```bash
+# после "[done]":
+head -3 cote_cfr/1v1_table.csv && du -h cote_cfr/1v1_table.csv
+```
+На ноуте:
+```bash
+scp <user>@<host>:~/megaverse/cote_cfr/1v1_table.csv cote_cfr/1v1_table.csv
+```
+Потом удалить сервер в панели управления. Таблица (gitignored, артефакт сборки)
+подхватывается `cfr_bot.py`/`gen_value_data.py` автоматически.
 
 ## Параметры драйвера
 
