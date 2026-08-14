@@ -101,7 +101,7 @@ class CFRBot:
             for w in worlds:
                 belief_vec[w.shields] += w.probability
             override = self.value_leaf.override(team_a, team_b, leaves,
-                                                belief_vec)
+                                                belief_vec, bot_side=0)
         mt.solve(self.iters, self.gamma, override)
         actions, probs, value = mt.strategy()
         idx = _pick(probs, self.temperature, self.rng)
