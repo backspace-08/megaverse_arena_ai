@@ -4,19 +4,33 @@ Decodes the Rust flat leaf states back into the actor-relative feature vector,
 feeds the belief over the ACTOR's opponent (the caller's belief when the actor
 is the caller's side, else a uniform prior over the other split), and returns
 the value from A's perspective (flipping the actor value when B acts).
+
+IMPORTANT: this module must stay import-torch-free at the top level. The
+multiprocessing workers on Windows (spawn) deadlock on torch's DLL import, so
+the workers only ever use the pure-numpy path (NumpyValueNet).
 """
 import os
 import sys
-
-import torch
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(BASE, ".."))
 sys.path.insert(0, REPO)
 
-from server.train_value_net import BELIEF_DIM, MAX_CHARS, ValueNet, char_slot  # noqa: E402
+MAX_CHARS = 3
+BELIEF_DIM = 9
 
 _IN_DIM = MAX_CHARS * 7 * 2 + 5 + BELIEF_DIM
+
+
+def char_slot(team, order, hp, k):
+    """Stack-order character slot: [type onehot(4), atk/2100, hp/600, alive]."""
+    if k >= len(order):
+        return [0.0] * 4 + [0.0, 0.0, 0.0]
+    idx = order[k]
+    typ, atk, _ = team[idx]
+    onehot = [0.0] * 4
+    onehot[typ] = 1.0
+    return onehot + [atk / 2100.0, hp[k] / 600.0, 1.0]
 
 
 def flat_to_features(team_a, team_b, fs, belief):
@@ -68,44 +82,71 @@ def uniform_belief(r):
     return [1.0 / (r + 1)] * (r + 1)
 
 
+class NumpyValueNet:
+    """Pure-numpy forward pass of the trained MLP (no torch import needed, so
+    multiprocessing workers on Windows/spawn cannot deadlock on torch's DLLs)."""
+
+    def __init__(self, npz_path):
+        import numpy as np
+        z = np.load(npz_path)
+        self.w1, self.b1 = z["w1"], z["b1"]
+        self.w2, self.b2 = z["w2"], z["b2"]
+        self.w3, self.b3 = z["w3"], z["b3"]
+
+    def __call__(self, x):
+        import numpy as np
+        h = np.maximum(x @ self.w1.T + self.b1, 0.0)
+        h = np.maximum(h @ self.w2.T + self.b2, 0.0)
+        return np.tanh(h @ self.w3.T + self.b3).reshape(-1)
+
+
 class ValueLeaf:
     """Evaluates 2v2/3v3 leaves with the trained network.
 
-    ``bot_side`` is the caller's side (0 or 1); the belief over the opponent's
-    split is passed per call (it updates every turn). Leaves where the actor is
-    the other side get a uniform prior over that side's split (we do not hold
-    their belief).
+    ``net`` is either a torch ValueNet or a NumpyValueNet; the belief over the
+    opponent's split is passed per call (it updates every turn). Leaves where
+    the actor is the other side get a uniform prior over that side's split (we
+    do not hold their belief).
     """
 
-    def __init__(self, model_path, bot_side):
-        self.net = ValueNet(_IN_DIM)
-        self.net.load_state_dict(torch.load(model_path, map_location="cpu",
-                                            weights_only=True))
-        self.net.eval()
-        self.bot_side = bot_side
+    def __init__(self, model_path):
+        if model_path.endswith(".npz"):
+            self.net = NumpyValueNet(model_path)
+        else:
+            import torch
+            from server.train_value_net import ValueNet
+            self.net = ValueNet(_IN_DIM)
+            self.net.load_state_dict(torch.load(model_path,
+                                                map_location="cpu",
+                                                weights_only=True))
+            self.net.eval()
 
-    def override(self, team_a, team_b, leaf_states, bot_belief, batch=512):
+    def override(self, team_a, team_b, leaf_states, bot_belief, bot_side,
+                 batch=512):
+        import numpy as np
         x = []
         keys = []
         for fs in leaf_states:
-            # actor = to_move (last field of the flat state)
             actor = fs[-1]
-            if actor == self.bot_side:
+            if actor == bot_side:
                 belief = bot_belief
             else:
                 r_other = _other_r(fs)
                 belief = uniform_belief(r_other)
             x.append(flat_to_features(team_a, team_b, fs, belief))
             keys.append(tuple(fs))
+        X = np.array(x, dtype=np.float32)
+        if isinstance(self.net, NumpyValueNet):
+            av = self.net(X)
+        else:
+            import torch
+            with torch.no_grad():
+                av = self.net(torch.from_numpy(X)).numpy()
         override = []
-        with torch.no_grad():
-            for i in range(0, len(x), batch):
-                xb = torch.tensor(x[i:i + batch], dtype=torch.float32)
-                av = self.net(xb)
-                for j, val in enumerate(av.tolist()):
-                    actor = leaf_states[i + j][-1]
-                    a_value = val if actor == 0 else -val
-                    override.append((keys[i + j], a_value))
+        for j in range(len(keys)):
+            actor = leaf_states[j][-1]
+            a_value = float(av[j]) if actor == 0 else -float(av[j])
+            override.append((keys[j], a_value))
         return override
 
 

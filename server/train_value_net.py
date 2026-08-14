@@ -18,19 +18,9 @@ import torch.nn as nn
 BASE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(BASE, ".."))
 sys.path.insert(0, os.path.join(REPO, "src"))
+sys.path.insert(0, REPO)
 
-MAX_CHARS = 3
-BELIEF_DIM = 9
-
-
-def char_slot(team, order, hp, k):
-    if k >= len(order):
-        return [0.0] * 4 + [0.0, 0.0, 0.0]  # type onehot 0, atk 0, hp 0, alive 0
-    idx = order[k]
-    typ, atk, _ = team[idx]
-    onehot = [0.0] * 4
-    onehot[typ] = 1.0
-    return onehot + [atk / 2100.0, hp[k] / 600.0, 1.0]
+from server.value_leaf import BELIEF_DIM, MAX_CHARS, char_slot  # noqa: E402
 
 
 def encode(row):
@@ -137,7 +127,14 @@ def main():
     vp = net(X[val_idx])
     print(f"trained: val MAE={mae(vp, y[val_idx]):.4f} (material {mae(mat_t[val_idx], y[val_idx]):.4f})")
     torch.save(net.state_dict(), a.out)
-    print(f"saved -> {a.out}")
+    npz = a.out.rsplit(".", 1)[0] + ".npz"
+    import numpy as np
+    sd = net.state_dict()
+    np.savez(npz,
+             w1=sd["net.0.weight"].numpy(), b1=sd["net.0.bias"].numpy(),
+             w2=sd["net.2.weight"].numpy(), b2=sd["net.2.bias"].numpy(),
+             w3=sd["net.4.weight"].numpy(), b3=sd["net.4.bias"].numpy())
+    print(f"saved -> {a.out} (+ {npz})")
 
 
 if __name__ == "__main__":

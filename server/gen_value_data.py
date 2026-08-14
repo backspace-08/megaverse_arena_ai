@@ -23,6 +23,7 @@ from multiprocessing import Pool
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(BASE, ".."))
+sys.path.insert(0, REPO)
 sys.path.insert(0, os.path.join(REPO, "src"))
 
 import _cote_cfr  # noqa: E402
@@ -30,7 +31,18 @@ import _cote_cfr  # noqa: E402
 _TABLE = os.path.join(REPO, "cote_cfr", "1v1_table_cap6.csv")
 _cote_cfr.load_1v1_table(_TABLE)
 
+_NET = None  # optional value network for leaves, set by the Pool initializer
+
 ATK_POOL = (1900, 2000, 2100)
+
+
+def _init_worker(net_path):
+    global _NET
+    if net_path:
+        print("worker: building ValueLeaf", flush=True)
+        from server.value_leaf import ValueLeaf
+        _NET = ValueLeaf(net_path)
+        print("worker: ValueLeaf ready", flush=True)
 
 
 def sample(rng, depth, cap):
@@ -71,7 +83,12 @@ def sample(rng, depth, cap):
 
     mt = _cote_cfr.MicroTree(team_a, team_b, roots, depth=depth, cap=cap,
                              start_turn=turn)
-    mt.solve(300, 0.995)
+    override = []
+    if _NET is not None:
+        leaves = mt.leaf_states()
+        belief_vec = [w / sum(weights) for w in weights]
+        override = _NET.override(team_a, team_b, leaves, belief_vec, to_move)
+    mt.solve(300, 0.995, override)
     _, _, value = mt.strategy()
     return {
         "teamA": team_a,
@@ -100,14 +117,20 @@ def main():
     ap.add_argument("--cap", type=int, default=6)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--net", default=None, help="value network .pt for leaves")
     ap.add_argument("--out", default=os.path.join(REPO, "table_out", "vdata1.pkl"))
     a = ap.parse_args()
     os.makedirs(os.path.dirname(a.out), exist_ok=True)
 
     t0 = time.time()
     tasks = [(a.seed * 1000 + i, a.depth, a.cap) for i in range(a.n)]
-    with Pool(a.workers) as pool:
-        rows = list(pool.imap_unordered(_worker, tasks))
+    with Pool(a.workers, initializer=_init_worker, initargs=(a.net,)) as pool:
+        rows = []
+        for i, row in enumerate(pool.imap_unordered(_worker, tasks)):
+            rows.append(row)
+            if (i + 1) % 50 == 0 or i + 1 == a.n:
+                print(f"  {i + 1}/{a.n} pos "
+                      f"({(time.time() - t0) / (i + 1):.2f}s/pos)", flush=True)
     dt = time.time() - t0
     values = [r["value"] for r in rows]
     with open(a.out, "wb") as fh:
