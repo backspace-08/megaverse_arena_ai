@@ -84,7 +84,8 @@ def main():
     ap.add_argument("--games", type=int, default=12)
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--cfr-depth", type=int, default=3)
-    ap.add_argument("--cfr-iters", type=int, default=200)
+    ap.add_argument("--cfr-iters", type=int, default=100,
+                    help="CFR iters per re-solve (100 == 200 results, ~2x faster)")
     ap.add_argument("--cfr-cap", type=int, default=6)
     ap.add_argument("--pl-depth", type=int, default=2)
     ap.add_argument("--pl-max-nodes", type=int, default=2000)
@@ -105,12 +106,16 @@ def main():
     cw = sum(1 for r in results if r["winner"] == "CFR")
     pw = sum(1 for r in results if r["winner"] == "PL")
     dr = sum(1 for r in results if r["winner"] == "DRAW")
+    lens = [r["half_turns"] for r in results]
     print("tag=%s 1v1 duels=%d  CFR=%d Planner=%d DRAW=%d  CFR-winrate=%.1f%%"
           % (a.tag, n, cw, pw, dr, 100.0 * cw / n))
+    print("  avg half_turns=%.1f  min=%d max=%d  draws=%.1f%%"
+          % (sum(lens) / n, min(lens), max(lens), 100.0 * dr / n))
     for seat in (True, False):
         rs = [r for r in results if r["cfr_first"] == seat]
         wn = sum(1 for r in rs if r["winner"] == "CFR")
-        print("  CFR-first=%s: CFR-wins %d/%d" % (seat, wn, len(rs)))
+        print("  CFR-first=%s: CFR-wins %d/%d = %.1f%%"
+              % (seat, wn, len(rs), 100.0 * wn / len(rs)))
     print("results -> %s" % out)
 
 
