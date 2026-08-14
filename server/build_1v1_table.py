@@ -80,8 +80,17 @@ def load_ckpt(d, name):
 
 def write_meta(d, meta):
     os.makedirs(d, exist_ok=True)
-    with open(os.path.join(d, "meta.json"), "w") as fh:
-        json.dump(meta, fh, indent=1)
+    p = os.path.join(d, "meta.json")
+    cur = {}
+    if os.path.exists(p):
+        try:
+            with open(p) as fh:
+                cur = json.load(fh)
+        except Exception:
+            cur = {}
+    cur.update(meta)
+    with open(p, "w") as fh:
+        json.dump(cur, fh, indent=1)
 
 
 def read_meta(d):
@@ -132,12 +141,14 @@ def repr_values(V, L):
 
 
 def run_phase4(pool, L, args, meta):
-    if meta and meta.get("phase4_done"):
+    if meta and meta.get("phase4_done") and meta.get("iters", 0) >= args.max_iters:
         return load_ckpt(args.ckpt_dir, "phase4")
-    if meta and meta.get("phase") == "phase4" and os.path.exists(ckpt_file(args.ckpt_dir, "phase4")):
+    if (meta and os.path.exists(ckpt_file(args.ckpt_dir, "phase4"))
+            and (not meta.get("phase4_done") or meta.get("iters", 0) < args.max_iters)):
         V = load_ckpt(args.ckpt_dir, "phase4")
-        start = meta.get("iter", 0)
-        print("[resume] phase-4 from iteration %d" % start, flush=True)
+        start = meta.get("iters", 0)
+        print("[resume] phase-4 from iteration %d (max_iters=%d)"
+              % (start, args.max_iters), flush=True)
     else:
         V = [0.0] * grid_size(L)
         start = 0
