@@ -99,7 +99,7 @@ def main():
     ap.add_argument("--depth", type=int, default=3)
     ap.add_argument("--cap", type=int, default=6)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--out", default=os.path.join(REPO, "table_out", "vdata1.pkl"))
     a = ap.parse_args()
     os.makedirs(os.path.dirname(a.out), exist_ok=True)
