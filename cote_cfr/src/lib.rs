@@ -280,6 +280,17 @@ impl Trunk {
 // crosses the PyO3 boundary.
 
 use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
+/// Canonical-belief 1v1 value table: (hA,hB,bankA,bankB,shA,shB,turn,to_move) -> value.
+/// Loaded once per process from `server/export_1v1_table.py`. Values are the
+/// equilibrium-belief 1v1 values (belief-dependence is a known limitation).
+type VKey = (i32, i32, i32, i32, i32, i32, i32, i32);
+static V1_TABLE: OnceLock<Mutex<HashMap<VKey, f64>>> = OnceLock::new();
+
+fn v1_table() -> &'static Mutex<HashMap<VKey, f64>> {
+    V1_TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 fn info_key_flat(s: &State) -> Vec<i32> {
     // acting player's public observation: (turn, orderA, hpA, orderB, hpB, own_bank, R)
@@ -470,6 +481,29 @@ impl MicroSolver {
         if s.order_b.is_empty() {
             return 1.0;
         }
+        // Exact 1v1 value when the game has reduced to a duel (one char each).
+        if s.order_a.len() == 1 && s.order_b.len() == 1 {
+            let da = self.trunk.dmg_units_between(0, s.order_a[0], 1, s.order_b[0]);
+            let db = self.trunk.dmg_units_between(1, s.order_b[0], 0, s.order_a[0]);
+            let hb = if da > 0 { (s.hp_b[0] + da - 1) / da } else { 1_000_000 };
+            let ha = if db > 0 { (s.hp_a[0] + db - 1) / db } else { 1_000_000 };
+            let key = (
+                ha.max(1),
+                hb.max(1),
+                s.bank_a,
+                s.bank_b,
+                s.sh_a,
+                s.sh_b,
+                s.turn,
+                s.to_move,
+            );
+            if let Ok(guard) = v1_table().lock() {
+                if let Some(&v) = guard.get(&key) {
+                    return v;
+                }
+            }
+        }
+        // Material fallback (2v2/3v3 leaves or a table miss).
         let ha: i32 = s.hp_a.iter().sum();
         let hb: i32 = s.hp_b.iter().sum();
         let material = (ha - hb) as f64 / 6000.0;
@@ -688,9 +722,45 @@ fn solve_micro(
     Ok((actions, probs, value))
 }
 
+#[pyfunction]
+fn load_1v1_table(path: String) -> PyResult<usize> {
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| PyValueError::new_err(format!("cannot read {}: {}", path, e)))?;
+    let mut guard = v1_table()
+        .lock()
+        .map_err(|_| PyValueError::new_err("table lock poisoned"))?;
+    guard.clear();
+    let mut count = 0usize;
+    for (lineno, line) in text.lines().enumerate() {
+        if lineno == 0 || line.trim().is_empty() {
+            continue;
+        }
+        let f: Vec<&str> = line.split(',').collect();
+        if f.len() < 9 {
+            continue;
+        }
+        let parse = |s: &str| -> i32 { s.trim().parse::<i32>().unwrap_or(0) };
+        let key = (
+            parse(f[0]),
+            parse(f[1]),
+            parse(f[2]),
+            parse(f[3]),
+            parse(f[4]),
+            parse(f[5]),
+            parse(f[6]),
+            parse(f[7]),
+        );
+        let val = f[8].trim().parse::<f64>().unwrap_or(0.0);
+        guard.insert(key, val);
+        count += 1;
+    }
+    Ok(count)
+}
+
 #[pymodule]
 fn _cote_cfr(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTrunk>()?;
     m.add_function(wrap_pyfunction!(solve_micro, m)?)?;
+    m.add_function(wrap_pyfunction!(load_1v1_table, m)?)?;
     Ok(())
 }
