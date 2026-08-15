@@ -43,10 +43,26 @@ log() { printf '\n\033[1;36m=== %s ===\033[0m\n' "$*"; }
 step_env() {
   log "env: verify toolchain"
   command -v python3 >/dev/null || { echo "python3 missing"; exit 1; }
-  command -v cargo >/dev/null || { echo "cargo (Rust) missing"; exit 1; }
+
+  # Rust via rustup if cargo is missing (fresh server).
+  if ! command -v cargo >/dev/null 2>&1; then
+    log "env: installing Rust via rustup"
+    if ! command -v curl >/dev/null 2>&1; then
+      echo "curl missing; install it first: sudo apt-get install -y curl" >&2
+      exit 1
+    fi
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+    # shellcheck disable=SC1091
+    source "$HOME/.cargo/env"
+  fi
+  command -v cargo >/dev/null || { echo "cargo still missing after rustup install"; exit 1; }
 
   if [ ! -d .venv ]; then
-    python3 -m venv .venv
+    python3 -m venv .venv 2>/dev/null || {
+      echo "python3 -m venv failed (need python3-venv on Debian/Ubuntu:)" >&2
+      echo "  sudo apt-get install -y python3-venv" >&2
+      exit 1
+    }
   fi
   # shellcheck disable=SC1091
   source .venv/bin/activate
