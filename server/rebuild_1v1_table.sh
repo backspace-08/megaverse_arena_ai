@@ -31,6 +31,12 @@ SMOKE_ITERS="${SMOKE_ITERS:-3}"
 SMOKE_HITS_MAX="${SMOKE_HITS_MAX:-6}"
 SMOKE_WORKERS="${SMOKE_WORKERS:-8}"
 
+# Rust build tuning. target-cpu=native lets LLVM use the full ISA of the build
+# machine (e.g. AVX-512 on Ice Lake) for the CFR numeric loops. Keep the flag
+# in sync with [profile.release] in cote_cfr/Cargo.toml.
+RUST_TARGET_CPU="${RUST_TARGET_CPU:-native}"
+RUSTFLAGS_CFR="-C target-cpu=$RUST_TARGET_CPU"
+
 TABLE=cote_cfr/1v1_table.csv
 TABLE_OLD=cote_cfr/1v1_table_old.csv
 CKPT=server/ckpt_1v1
@@ -81,10 +87,19 @@ step_env() {
   pip install --quiet --upgrade pip numpy maturin
 
   # ---- build the Rust engine ---------------------------------------------------
-  if ! python -c "import _cote_cfr" 2>/dev/null; then
-    log "env: building Rust engine"
-    python -m maturin build --release -m cote_cfr/Cargo.toml
-    pip install --quiet --no-deps cote_cfr/target/wheels/*.whl
+  # Rebuild when the engine is missing OR the target-cpu flag changed (the
+  # venv marker records which flags the installed wheel was built with).
+  local built_flag=""
+  if [ -f ".venv/.cote_cfr_rustflags" ]; then
+    built_flag="$(cat .venv/.cote_cfr_rustflags)"
+  fi
+  if ! python -c "import _cote_cfr" 2>/dev/null || [ "$built_flag" != "$RUSTFLAGS_CFR" ]; then
+    log "env: building Rust engine (RUSTFLAGS=$RUSTFLAGS_CFR)"
+    RUSTFLAGS="$RUSTFLAGS_CFR" python -m maturin build --release -m cote_cfr/Cargo.toml
+    pip install --quiet --no-deps --force-reinstall cote_cfr/target/wheels/*.whl
+    printf '%s' "$RUSTFLAGS_CFR" > .venv/.cote_cfr_rustflags
+  else
+    log "env: Rust engine already built with $RUSTFLAGS_CFR"
   fi
   python -c "import sys; sys.path.insert(0,'.'); sys.path.insert(0,'src'); import _cote_cfr; print('engine OK')"
 }
