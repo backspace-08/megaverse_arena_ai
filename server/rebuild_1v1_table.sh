@@ -40,34 +40,47 @@ TABLE_TEST=server/table_test.csv
 log() { printf '\n\033[1;36m=== %s ===\033[0m\n' "$*"; }
 
 # ------------------------------------------------------------------ env
+# Install every system dependency automatically: apt packages (gcc for the
+# Rust linker, python3-venv/pip, curl), Rust via rustup, a venv with numpy +
+# maturin, then build the Rust engine. Runs on a bare Ubuntu/Debian VM.
 step_env() {
   log "env: verify toolchain"
-  command -v python3 >/dev/null || { echo "python3 missing"; exit 1; }
 
-  # Rust via rustup if cargo is missing (fresh server).
-  if ! command -v cargo >/dev/null 2>&1; then
-    log "env: installing Rust via rustup"
-    if ! command -v curl >/dev/null 2>&1; then
-      echo "curl missing; install it first: sudo apt-get install -y curl" >&2
+  # ---- system packages (apt) ------------------------------------------------
+  local need_apt=0
+  command -v gcc >/dev/null 2>&1 || need_apt=1
+  command -v curl >/dev/null 2>&1 || need_apt=1
+  command -v make >/dev/null 2>&1 || need_apt=1
+  python3 -m venv --help >/dev/null 2>&1 || need_apt=1
+  python3 -m pip --version >/dev/null 2>&1 || need_apt=1
+  if [ "$need_apt" = "1" ]; then
+    log "env: installing system packages (gcc, make, curl, python3-venv, python3-pip)"
+    if ! command -v sudo >/dev/null 2>&1; then
+      echo "sudo missing; run this script as root or install sudo first" >&2
       exit 1
     fi
+    sudo apt-get update -qq
+    sudo apt-get install -y -qq build-essential curl python3-venv python3-pip
+  fi
+
+  # ---- Rust via rustup if cargo is missing (fresh server) --------------------
+  if ! command -v cargo >/dev/null 2>&1; then
+    log "env: installing Rust via rustup"
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
     # shellcheck disable=SC1091
     source "$HOME/.cargo/env"
   fi
   command -v cargo >/dev/null || { echo "cargo still missing after rustup install"; exit 1; }
 
+  # ---- venv + python deps ----------------------------------------------------
   if [ ! -d .venv ]; then
-    python3 -m venv .venv 2>/dev/null || {
-      echo "python3 -m venv failed (need python3-venv on Debian/Ubuntu:)" >&2
-      echo "  sudo apt-get install -y python3-venv" >&2
-      exit 1
-    }
+    python3 -m venv .venv
   fi
   # shellcheck disable=SC1091
   source .venv/bin/activate
   pip install --quiet --upgrade pip numpy maturin
 
+  # ---- build the Rust engine ---------------------------------------------------
   if ! python -c "import _cote_cfr" 2>/dev/null; then
     log "env: building Rust engine"
     python -m maturin build --release -m cote_cfr/Cargo.toml
