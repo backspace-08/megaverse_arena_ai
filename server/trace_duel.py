@@ -34,8 +34,8 @@ def main():
     ap.add_argument("--cfr-first", action="store_true",
                     help="CFR moves first (default: Planner first)")
     ap.add_argument("--start-turn", type=int, default=7)
-    ap.add_argument("--cfr-iters", type=int, default=150)
-    ap.add_argument("--cfr-depth", type=int, default=4)
+    ap.add_argument("--cfr-iters", type=int, default=120)
+    ap.add_argument("--cfr-depth", type=int, default=3)
     ap.add_argument("--max-half-turns", type=int, default=40)
     a = ap.parse_args()
 
@@ -97,3 +97,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

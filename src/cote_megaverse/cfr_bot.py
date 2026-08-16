@@ -62,7 +62,7 @@ def _encode_state(state, opp_bank, opp_sh):
 
 
 class CFRBot:
-    def __init__(self, depth=4, iters=150, cap=6, gamma=0.995,
+    def __init__(self, depth=3, iters=120, cap=6, gamma=0.995,
                  temperature=0.0, rng=None, value_leaf=None, prune_after=20,
                  use_opening_book=False):
         self.depth = depth
@@ -233,3 +233,4 @@ def _pick(probs, rng):
         if p > best:
             best, best_i = p, i
     return best_i
+

@@ -30,7 +30,7 @@ def make_side(t, hp=HP, shields=0):
 
 class ReachConservationTests(unittest.TestCase):
     def test_reach_conservation(self):
-        bot = CFRBot(depth=4, iters=80, cap=6, gamma=0.995, prune_after=20,
+        bot = CFRBot(depth=3, iters=80, cap=6, gamma=0.995, prune_after=20,
                      temperature=1.0, rng=random.Random(1))
         state = GameState(player=make_side(Type.A), opponent=make_side(Type.A),
                           turn=7, player_to_move=True).prepare()
@@ -42,7 +42,7 @@ class ReachConservationTests(unittest.TestCase):
 
 class TurtlingPunishmentTests(unittest.TestCase):
     def _run(self, seed):
-        bot = CFRBot(depth=4, iters=120, cap=6, gamma=0.995, prune_after=20,
+        bot = CFRBot(depth=3, iters=120, cap=6, gamma=0.995, prune_after=20,
                      temperature=1.0, rng=random.Random(seed))
         # CFR 7500 (5 hits) vs PL 1500 (1 hit) holding d4 shields, CFR to move
         state = GameState(player=make_side(Type.A, 7500),
@@ -83,7 +83,7 @@ class TurtlingPunishmentTests(unittest.TestCase):
 class LethalBurstDefenseTests(unittest.TestCase):
     def test_lethal_burst_defense(self):
         # PL at 1 HP, holds bank=4 (belief exact), will burst a8. CFR must shield.
-        bot = CFRBot(depth=4, iters=120, cap=6, gamma=0.995, prune_after=20,
+        bot = CFRBot(depth=3, iters=120, cap=6, gamma=0.995, prune_after=20,
                      rng=None)  # argmax for determinism
         state = GameState(player=make_side(Type.A, 7500),
                           opponent=make_side(Type.A, 1500),
@@ -100,3 +100,4 @@ class LethalBurstDefenseTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
