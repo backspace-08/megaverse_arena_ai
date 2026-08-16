@@ -70,6 +70,13 @@ class OpponentModel:
     records: list[TurnRecord] = field(default_factory=list)
     _candidates: dict[tuple[int, int], float] = field(
         default_factory=lambda: {(0, 0): 1.0})
+    # Dirichlet/Laplace counters over hidden splits (shields, bank). Every
+    # split starts at 1.0 (Laplace smoothing == uniform prior). Public evidence
+    # - a resolved attack (pins/bounds shields) or a revealed budget (proves
+    # bank) - adds weight to the consistent splits. The prior over the current
+    # remainder is therefore `counts / sum(counts)`, so the belief keeps MEMORY
+    # across turns instead of resetting to a stateless uniform every round.
+    _counts: dict[tuple[int, int], float] = field(default_factory=dict)
 
     # ---------------------------------------------------------------- observe
 
@@ -112,6 +119,14 @@ class OpponentModel:
             self._restrict(lambda shields, bank: shields == blocked)
         else:
             self._restrict(lambda shields, bank: shields >= attacks)
+        # Dirichlet evidence: the surviving worlds are exactly the splits
+        # consistent with what our attack revealed, so give them +1 weight
+        # spread over the survivors (total evidence +1.0).
+        consistent = list(self._candidates)
+        if consistent:
+            w = 1.0 / len(consistent)
+            for split in consistent:
+                self._counts[split] = self._counts.get(split, 1.0) + w
 
     def expire_shields(self):
         """Clear held shields after our allocation resolved. Bank survives."""
@@ -165,20 +180,18 @@ class OpponentModel:
     # ---------------------------------------------------------------- helpers
 
     def _prior(self, remainder: int) -> dict[tuple[int, int], float]:
-        """Max-entropy uniform prior over the splits of ``remainder``.
+        """Dirichlet-Laplace prior over the splits of ``remainder``.
 
-        Strictly identical to the table builder's ``build_belief_roots``: every
-        legal split (shields, bank) with shields + bank == remainder carries an
-        equal weight of 1/(R+1) (banking is capped, so R > MAX_BONUS yields
-        1/(MAX_BONUS+1) splits on both sides). No type hypotheses, no
-        desperation, no magic weights. Evidence is applied separately via
-        ``_restrict`` on public facts only.
+        Every legal split starts at weight 1.0; evidence accumulated from past
+        turns (``_counts``) tilts the prior toward the splits the opponent has
+        actually used. With no evidence this reduces to the max-entropy uniform
+        1/(R+1) - identical to the table builder's ``build_belief_roots``.
         """
         splits = legal_splits(remainder)
         if len(splits) == 1:
             return {splits[0]: 1.0}
-        w = 1.0 / len(splits)
-        return {split: w for split in splits}
+        total = sum(self._counts.get(s, 1.0) for s in splits)
+        return {s: self._counts.get(s, 1.0) / total for s in splits}
 
     def _restrict(self, predicate):
         """Keep only worlds consistent with new evidence."""
@@ -192,8 +205,14 @@ class OpponentModel:
         if not self.records:
             return
         self._restrict(lambda shields, bank: bank == revealed_bank)
-        surviving = [key for key in self._candidates if key[1] == revealed_bank]
-        if len(surviving) == 1:
-            shields = surviving[0][0]
+        consistent = [key for key in self._candidates if key[1] == revealed_bank]
+        if len(consistent) == 1:
+            shields = consistent[0][0]
             self.records[-1] = TurnRecord(
                 **{**self.records[-1].__dict__, "confirmed_shields": shields})
+        # Dirichlet evidence: the opponent provably held this bank, so give the
+        # consistent splits +1 weight (total evidence +1.0).
+        if consistent:
+            w = 1.0 / len(consistent)
+            for split in consistent:
+                self._counts[split] = self._counts.get(split, 1.0) + w
