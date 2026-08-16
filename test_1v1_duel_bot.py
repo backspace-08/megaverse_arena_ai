@@ -20,6 +20,7 @@ Default: 50 duplicate pairs (100 matches) on Profile A.
 import argparse
 import json
 import os
+import random
 import sys
 from dataclasses import replace
 from multiprocessing import Pool
@@ -69,15 +70,16 @@ def make_side(t, hp, atk):
 
 def run_duel(seed, cfr_first, profile, cfr_depth, cfr_iters, cfr_cap,
              pl_depth, pl_max_nodes, cfr_gamma, cfr_prune_after,
-             max_half_turns=40):
+             cfr_temperature, start_turn, max_half_turns=40):
     prof = PROFILES[profile]
     state = GameState(player=make_side(prof["cfr_type"], prof["hp"], prof["atk"]),
                       opponent=make_side(prof["pl_type"], prof["hp"], prof["atk"]),
-                      turn=1, player_to_move=True).prepare()
+                      turn=start_turn, player_to_move=True).prepare()
     if not cfr_first:
         state = replace(state, player_to_move=False).prepare()
     cfr = CFRBot(depth=cfr_depth, iters=cfr_iters, cap=cfr_cap, gamma=cfr_gamma,
-                 prune_after=cfr_prune_after)
+                 prune_after=cfr_prune_after, temperature=cfr_temperature,
+                 rng=random.Random(seed))
     pl = Planner(depth=pl_depth, max_nodes=pl_max_nodes)
     for _ in range(max_half_turns):
         if state.player.lost or state.opponent.lost:
@@ -110,9 +112,11 @@ def run_duel(seed, cfr_first, profile, cfr_depth, cfr_iters, cfr_cap,
 
 def _worker(task):
     (seed, cfr_first, profile, cfr_depth, cfr_iters, cfr_cap, pl_depth,
-     pl_max_nodes, cfr_gamma, cfr_prune_after) = task
+     pl_max_nodes, cfr_gamma, cfr_prune_after, cfr_temperature,
+     start_turn) = task
     return run_duel(seed, cfr_first, profile, cfr_depth, cfr_iters, cfr_cap,
-                    pl_depth, pl_max_nodes, cfr_gamma, cfr_prune_after)
+                    pl_depth, pl_max_nodes, cfr_gamma, cfr_prune_after,
+                    cfr_temperature, start_turn)
 
 
 def main():
@@ -123,14 +127,19 @@ def main():
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--max-half-turns", type=int, default=40,
                     help="turn cap; reaching it is a draw (0.0)")
-    ap.add_argument("--cfr-depth", type=int, default=3)
+    ap.add_argument("--cfr-depth", type=int, default=4,
+                    help="phase-4 (turn>=7) resolve depth; even depth = whole rounds")
     ap.add_argument("--cfr-iters", type=int, default=100)
     ap.add_argument("--cfr-prune-after", type=int, default=20)
+    ap.add_argument("--cfr-temperature", type=float, default=1.0,
+                    help="sample actions from the CFR strategy (1.0); 0 = argmax")
     ap.add_argument("--cfr-cap", type=int, default=6)
     ap.add_argument("--pl-depth", type=int, default=2)
     ap.add_argument("--pl-max-nodes", type=int, default=2000)
     ap.add_argument("--cfr-gamma", type=float, default=0.995)
     ap.add_argument("--seed-start", type=int, default=7000)
+    ap.add_argument("--start-turn", type=int, default=7,
+                    help="duel starts at this turn (7 = phase-4, table is authoritative)")
     ap.add_argument("--tag", default="duel")
     a = ap.parse_args()
 
@@ -145,7 +154,7 @@ def main():
         for cfr_first in (True, False):
             tasks.append((seed, cfr_first, a.profile, a.cfr_depth, a.cfr_iters,
                           a.cfr_cap, a.pl_depth, a.pl_max_nodes, a.cfr_gamma,
-                          a.cfr_prune_after))
+                          a.cfr_prune_after, a.cfr_temperature, a.start_turn))
 
     with Pool(a.workers) as pool:
         results = list(pool.imap_unordered(_worker, tasks))

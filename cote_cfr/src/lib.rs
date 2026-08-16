@@ -1355,19 +1355,10 @@ fn solve_1v1_step(
 }
 
 /// Belief-root states for one belief-state: all (bank_opp, sh_opp) with
-/// bank_opp + sh_opp == r, weighted by a TYPE-MIXTURE prior over the
-/// defender's behaviour, not by a flat uniform prior. mv selects whose own
-/// split is known: mv=0 (A acts) -> (bank_a, sh_a) = (bk, sh); mv=1 -> B's.
-///
-/// The prior is the same three-type mixture used at runtime in
-/// ``infoset.OpponentModel``: "full shielder" (H1, every action goes to
-/// shields -> split (R, 0)), "no shielder" (H0s, never shields -> (0, R))
-/// and "random" (Hr, uniform over the legal splits). The weight of the full
-/// shielder grows with the defender's desperation (low remaining HP): a
-/// 1-HP defender must play maximal shields, so P(sh = R) concentrates toward
-/// ~0.7 instead of the flat 1/(R+1) that the uniform prior assigned. This is
-/// O(1) per cell, has no recursive dependency on the defender's past bank,
-/// and keeps every legal split alive via a small uniform floor (AGENT.md §9).
+/// bank_opp + sh_opp == r, weighted by a MAX-ENTROPY UNIFORM prior: every
+/// legal split gets exactly 1/(R+1). No type hypotheses, no desperation, no
+/// magic weights - identical to the runtime prior in ``infoset.OpponentModel``
+/// so table builder and resolver believe the same thing.
 fn build_belief_roots(
     layout: &V1Layout,
     _trunk: &Trunk,
@@ -1386,29 +1377,10 @@ fn build_belief_roots(
     let bmax = r.min(layout.bank_max as i32);
     let n = (bmax - bmin + 1) as f64;
     let mut roots = Vec::with_capacity((bmax - bmin + 1) as usize);
-
-    // Defender's remaining HP decides how much it must shield.
-    let hp_def = if mv == 0 { hB } else { hA };
-    // Full-shielder weight: maximal when the defender is at 1 HP, decays
-    // linearly as its HP grows (a healthy defender is not forced to turtle).
-    let hits_span = (layout.hits_max as i32 - layout.hits_min as i32 + 1).max(1) as f64;
-    let desperation = ((layout.hits_max as i32 - hp_def).max(0) as f64) / hits_span;
-    let p_full = 0.70 * desperation + 0.05;
-    let p_none = 0.08 * (1.0 - desperation) + 0.02;
-    let p_rand = (1.0 - p_full - p_none).max(0.02);
+    let w = if r == 0 { 1.0 } else { 1.0 / n };
 
     for bank_opp in bmin..=bmax {
         let sh_opp = r - bank_opp;
-        let w_rand = p_rand / n;
-        let w = if r == 0 {
-            1.0 // only (0,0) is legal; nothing is hidden
-        } else if sh_opp == r {
-            p_full + w_rand
-        } else if sh_opp == 0 {
-            p_none + w_rand
-        } else {
-            w_rand
-        };
         let state = if mv == 0 {
             State {
                 order_a: vec![0],

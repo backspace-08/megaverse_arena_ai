@@ -62,8 +62,9 @@ def _encode_state(state, opp_bank, opp_sh):
 
 
 class CFRBot:
-    def __init__(self, depth=3, iters=150, cap=6, gamma=0.995,
-                 temperature=0.0, rng=None, value_leaf=None, prune_after=20):
+    def __init__(self, depth=4, iters=150, cap=6, gamma=0.995,
+                 temperature=0.0, rng=None, value_leaf=None, prune_after=20,
+                 use_opening_book=False):
         self.depth = depth
         self.iters = iters
         self.cap = cap
@@ -72,6 +73,10 @@ class CFRBot:
         self.rng = rng
         # regret-pruning burn-in (iterations before negative-regret actions are skipped)
         self.prune_after = prune_after
+        # OpeningBook: cache resolves by (teams, turn, belief roots). The key
+        # DOES include the belief, so it cannot serve a stale strategy for a
+        # different posterior; disabled by default (re-resolve every move).
+        self.use_opening_book = use_opening_book
         # optional belief-conditioned value network for the leaves (ReBeL/DeepStack)
         self.value_leaf = value_leaf
         self.model = OpponentModel()
@@ -117,7 +122,7 @@ class CFRBot:
         # (turn >= 7); turn >= 7 re-solves a shallow phase-4 lookahead.
         depth = 7 - turn if turn < 7 else self.depth
         probe = None
-        if self.value_leaf is None:
+        if self.use_opening_book and self.value_leaf is None:
             probe = (tuple(team_a), tuple(team_b), turn,
                      tuple((tuple(r[0]), round(r[1], 6)) for r in roots))
             hit = _OPENING_BOOK.get(probe)
@@ -141,7 +146,7 @@ class CFRBot:
         return self._play(actions, probs, value, worlds)
 
     def _play(self, actions, probs, value, worlds):
-        idx = _pick(probs, self.temperature, self.rng)
+        idx = _pick(probs, self.rng)
         a, d, b, sw = actions[idx]
         self.last_report = {
             "value": value,
@@ -173,15 +178,28 @@ def _masked(state):
                      state.turn, state.player_to_move)
 
 
-def _pick(probs, temperature, rng):
-    if temperature > 0 and rng is not None:
-        pick = rng.random() * sum(probs)
-        acc = 0.0
+def _pick(probs, rng):
+    """Sample directly from the CFR average strategy (no temperature/softmax -
+    that would inflate dead branches; the CFR output is already a distribution).
+    Residual-noise cutoff: actions with p < 0.02 are solver noise, zeroed and
+    the rest renormalized. Falls back to argmax only when no rng is given."""
+    if rng is None:
+        best, best_i = -1.0, 0
         for i, p in enumerate(probs):
-            acc += p
-            if pick <= acc:
-                return i
-        return len(probs) - 1
+            if p > best:
+                best, best_i = p, i
+        return best_i
+    total = sum(p for p in probs if p >= 0.02)
+    if total <= 0.0:
+        total = sum(probs)
+    pick = rng.random() * total
+    acc = 0.0
+    for i, p in enumerate(probs):
+        if p < 0.02:
+            continue
+        acc += p
+        if pick <= acc:
+            return i
     best, best_i = -1.0, 0
     for i, p in enumerate(probs):
         if p > best:
