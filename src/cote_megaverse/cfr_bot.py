@@ -27,6 +27,14 @@ except Exception as exc:  # pragma: no cover - best-effort table load
 from .infoset import OpponentModel  # noqa: E402
 from .rules import Allocation, base_budget  # noqa: E402
 
+# Continual Subgame Resolving: turns 1..6 are NOT precomputed as intermediate
+# tables. The bot resolves the current state on the fly to depth (7 - turn) so
+# every leaf lands in the stationary phase-4 table (turn >= 7 is the fixed
+# point V = T(V)); turn >= 7 resolves a shallow fixed-point lookahead. The
+# opening (turn 1) is deterministic given the teams, so it is cached.
+_OPENING_BOOK = {}
+_OPENING_BOOK_MAX = 4096
+
 
 def _team_of(side):
     return [(c.type.value, c.atk, c.max_hp // 10) for c in side.characters]
@@ -54,14 +62,16 @@ def _encode_state(state, opp_bank, opp_sh):
 
 
 class CFRBot:
-    def __init__(self, depth=3, iters=400, cap=6, gamma=0.995,
-                 temperature=0.0, rng=None, value_leaf=None):
+    def __init__(self, depth=3, iters=150, cap=6, gamma=0.995,
+                 temperature=0.0, rng=None, value_leaf=None, prune_after=20):
         self.depth = depth
         self.iters = iters
         self.cap = cap
         self.gamma = gamma
         self.temperature = temperature
         self.rng = rng
+        # regret-pruning burn-in (iterations before negative-regret actions are skipped)
+        self.prune_after = prune_after
         # optional belief-conditioned value network for the leaves (ReBeL/DeepStack)
         self.value_leaf = value_leaf
         self.model = OpponentModel()
@@ -102,8 +112,19 @@ class CFRBot:
         team_b = _team_of(state.opponent)
         roots = [(_encode_state(state, w.bank, w.shields), w.probability)
                  for w in worlds]
-        mt = _cote_cfr.MicroTree(team_a, team_b, roots, depth=self.depth,
-                                 cap=self.cap, start_turn=state.turn)
+        turn = state.turn
+        # Continual Subgame Resolving: turns 1..6 reach the phase-4 fixed point
+        # (turn >= 7); turn >= 7 re-solves a shallow phase-4 lookahead.
+        depth = 7 - turn if turn < 7 else self.depth
+        probe = None
+        if self.value_leaf is None:
+            probe = (tuple(team_a), tuple(team_b), turn,
+                     tuple((tuple(r[0]), round(r[1], 6)) for r in roots))
+            hit = _OPENING_BOOK.get(probe)
+            if hit is not None:
+                return self._play(hit[0], hit[1], hit[2], worlds)
+        mt = _cote_cfr.MicroTree(team_a, team_b, roots, depth=depth,
+                                 cap=self.cap, start_turn=turn)
         override = []
         if self.value_leaf is not None:
             leaves = mt.leaf_states()
@@ -113,8 +134,13 @@ class CFRBot:
                 belief_vec[w.shields] += w.probability
             override = self.value_leaf.override(team_a, team_b, leaves,
                                                 belief_vec, bot_side=0)
-        mt.solve(self.iters, self.gamma, override)
+        mt.solve(self.iters, self.gamma, override, self.prune_after)
         actions, probs, value = mt.strategy()
+        if probe is not None and len(_OPENING_BOOK) < _OPENING_BOOK_MAX:
+            _OPENING_BOOK[probe] = (actions, probs, value)
+        return self._play(actions, probs, value, worlds)
+
+    def _play(self, actions, probs, value, worlds):
         idx = _pick(probs, self.temperature, self.rng)
         a, d, b, sw = actions[idx]
         self.last_report = {
