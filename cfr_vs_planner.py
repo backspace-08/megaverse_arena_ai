@@ -33,8 +33,11 @@ def run_match(seed, new_first, cfr_depth, cfr_iters, cfr_cap,
     if net:
         from server.value_leaf import ValueLeaf
         value_leaf = ValueLeaf(net)
+    else:
+        from cote_megaverse.chain_leaf import ChainLeaf
+        value_leaf = ChainLeaf()
     cfr = CFRBot(depth=cfr_depth, iters=cfr_iters, cap=cfr_cap,
-                 value_leaf=value_leaf)
+                 value_leaf=value_leaf, compress=True)
     pl = Planner(depth=pl_depth, max_nodes=pl_max_nodes)
     try:
         for _ in range(80):
