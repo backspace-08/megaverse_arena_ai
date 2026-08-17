@@ -46,6 +46,8 @@ PROFILES = {
           "pl_type": Type.D, "cfr_type": Type.A},          # D beats A: PL 1.3
     "C": {"hp": 22000, "atk": 2000,
           "pl_type": Type.B, "cfr_type": Type.A},          # A beats B: CFR 1.3
+    "E": {"hp": 24000, "atk": 1500, "even": True,
+          "pl_type": Type.A, "cfr_type": Type.A},          # (13,16) A-to-move ~even
 }
 
 
@@ -72,8 +74,16 @@ def run_duel(seed, cfr_first, profile, cfr_depth, cfr_iters, cfr_cap,
              pl_depth, pl_max_nodes, cfr_gamma, cfr_prune_after,
              cfr_temperature, start_turn, max_half_turns=40):
     prof = PROFILES[profile]
-    state = GameState(player=make_side(prof["cfr_type"], prof["hp"], prof["atk"]),
-                      opponent=make_side(prof["pl_type"], prof["hp"], prof["atk"]),
+    if prof.get("even"):
+        # (13,16) A-to-move ~even position: the 13-hit side always moves
+        # first, so the duplicate mirror is (16,13) with the 16-hit side
+        # second - both seats are within ~0.04 of even.
+        cfr_hp = 19500 if cfr_first else 24000   # 13 hits if CFR opens
+        pl_hp = 24000 if cfr_first else 19500    # 16 hits if CFR opens
+    else:
+        cfr_hp = pl_hp = prof["hp"]
+    state = GameState(player=make_side(prof["cfr_type"], cfr_hp, prof["atk"]),
+                      opponent=make_side(prof["pl_type"], pl_hp, prof["atk"]),
                       turn=start_turn, player_to_move=True).prepare()
     if not cfr_first:
         state = replace(state, player_to_move=False).prepare()
@@ -144,9 +154,13 @@ def main():
     a = ap.parse_args()
 
     prof = PROFILES[a.profile]
-    hits = profile_hits(prof)
-    print("[profile %s] HP=%d ATK=%d  hits: CFR->PL %d, PL->CFR %d"
-          % (a.profile, prof["hp"], prof["atk"], hits[0], hits[1]), flush=True)
+    if prof.get("even"):
+        print("[profile %s] even position (13,16) A-to-move V~0: CFR %d vs PL %d hits, "
+              "13-hit side always opens" % (a.profile, 13, 16), flush=True)
+    else:
+        hits = profile_hits(prof)
+        print("[profile %s] HP=%d ATK=%d  hits: CFR->PL %d, PL->CFR %d"
+              % (a.profile, prof["hp"], prof["atk"], hits[0], hits[1]), flush=True)
 
     tasks = []
     for i in range(a.pairs):
