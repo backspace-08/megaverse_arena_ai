@@ -46,9 +46,28 @@ PROFILES = {
           "pl_type": Type.D, "cfr_type": Type.A},          # D beats A: PL 1.3
     "C": {"hp": 22000, "atk": 2000,
           "pl_type": Type.B, "cfr_type": Type.A},          # A beats B: CFR 1.3
-    "E": {"hp": 24000, "atk": 1500, "even": True,
-          "pl_type": Type.A, "cfr_type": Type.A},          # (13,16) A-to-move ~even
+    "E": {"even": "E", "atk": 1500, "pl_type": Type.A, "cfr_type": Type.A},
+    "F": {"even": "F", "atk": 1500, "pl_type": Type.A, "cfr_type": Type.A},
+    "G": {"even": "G", "atk": 1500, "pl_type": Type.A, "cfr_type": Type.A},
+    "H": {"even": "H", "atk": 1500, "pl_type": Type.A, "cfr_type": Type.A},
 }
+
+
+def even_seat(profile, cfr_first):
+    """(cfr_hits, pl_hits, cfr_hidden, pl_hidden) for a near-even start, seat by seat.
+    hidden = (shields, bank) the side currently holds (opponent's R is hidden)."""
+    if profile == "E":      # (13,16) A-to-move, clean: fewer-hit side opens
+        return (13, 16, (0, 0), (0, 0)) if cfr_first else (16, 13, (0, 0), (0, 0))
+    if profile == "F":      # (11,14)
+        return (11, 14, (0, 0), (0, 0)) if cfr_first else (14, 11, (0, 0), (0, 0))
+    if profile == "G":      # (12,15)
+        return (12, 15, (0, 0), (0, 0)) if cfr_first else (15, 12, (0, 0), (0, 0))
+    if profile == "H":      # (15,16) A-to-move, B holds R=3 hidden
+        if cfr_first:       # CFR=A(15) opens, PL=B(16) holds 3 hidden
+            return (15, 16, (0, 0), (1, 2))
+        # mirror (16,15) B-to-move: PL opens with 15, CFR=16 holds 3 hidden
+        return (16, 15, (1, 2), (0, 0))
+    raise ValueError(profile)
 
 
 def profile_hits(prof):
@@ -65,25 +84,29 @@ def profile_hits(prof):
             max(1, -(-h // per_hit(prof["atk"], pl_m))))
 
 
-def make_side(t, hp, atk):
+def make_side(t, hp, atk, shields=0, bonus=0):
     return Side(characters=(Character(type=t, hp=hp, atk=atk, max_hp=hp),),
-                active=0, stack_order=(0,), bonus=0, shields=0, actions=0)
+                active=0, stack_order=(0,), bonus=bonus, shields=shields,
+                actions=0)
 
 
 def run_duel(seed, cfr_first, profile, cfr_depth, cfr_iters, cfr_cap,
              pl_depth, pl_max_nodes, cfr_gamma, cfr_prune_after,
              cfr_temperature, start_turn, max_half_turns=40):
     prof = PROFILES[profile]
-    if prof.get("even"):
-        # (13,16) A-to-move ~even position: the 13-hit side always moves
-        # first, so the duplicate mirror is (16,13) with the 16-hit side
-        # second - both seats are within ~0.04 of even.
-        cfr_hp = 19500 if cfr_first else 24000   # 13 hits if CFR opens
-        pl_hp = 24000 if cfr_first else 19500    # 16 hits if CFR opens
+    if "even" in prof:
+        cfr_h, pl_h, cfr_hid, pl_hid = even_seat(prof["even"], cfr_first)
+        cfr_hp = cfr_h * 1500
+        pl_hp = pl_h * 1500
+        cfr_sh, cfr_bk = cfr_hid
+        pl_sh, pl_bk = pl_hid
     else:
         cfr_hp = pl_hp = prof["hp"]
-    state = GameState(player=make_side(prof["cfr_type"], cfr_hp, prof["atk"]),
-                      opponent=make_side(prof["pl_type"], pl_hp, prof["atk"]),
+        cfr_sh = cfr_bk = pl_sh = pl_bk = 0
+    state = GameState(player=make_side(prof["cfr_type"], cfr_hp, prof["atk"],
+                                       shields=cfr_sh, bonus=cfr_bk),
+                      opponent=make_side(prof["pl_type"], pl_hp, prof["atk"],
+                                         shields=pl_sh, bonus=pl_bk),
                       turn=start_turn, player_to_move=True).prepare()
     if not cfr_first:
         state = replace(state, player_to_move=False).prepare()
@@ -154,9 +177,13 @@ def main():
     a = ap.parse_args()
 
     prof = PROFILES[a.profile]
-    if prof.get("even"):
-        print("[profile %s] even position (13,16) A-to-move V~0: CFR %d vs PL %d hits, "
-              "13-hit side always opens" % (a.profile, 13, 16), flush=True)
+    if "even" in prof:
+        pos = {  # noqa: E702
+            "E": "(13,16) R0 V=-0.041", "F": "(11,14) R0 V=-0.038",
+            "G": "(12,15) R0 V=-0.038", "H": "(15,16) R3 V=-0.019",
+        }[prof["even"]]
+        print("[profile %s] even %s, 13-hit style side opens" % (a.profile, pos),
+              flush=True)
     else:
         hits = profile_hits(prof)
         print("[profile %s] HP=%d ATK=%d  hits: CFR->PL %d, PL->CFR %d"
