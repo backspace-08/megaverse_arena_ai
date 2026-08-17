@@ -49,7 +49,7 @@ PROFILES = {
     "E": {"even": "E", "atk": 1500, "pl_type": Type.A, "cfr_type": Type.A},
     "F": {"even": "F", "atk": 1500, "pl_type": Type.A, "cfr_type": Type.A},
     "G": {"even": "G", "atk": 1500, "pl_type": Type.A, "cfr_type": Type.A},
-    "H": {"even": "H", "atk": 1500, "pl_type": Type.A, "cfr_type": Type.A},
+    "I": {"even": "I", "atk": 1500, "pl_type": Type.A, "cfr_type": Type.A},
 }
 
 
@@ -62,11 +62,8 @@ def even_seat(profile, cfr_first):
         return (11, 14, (0, 0), (0, 0)) if cfr_first else (14, 11, (0, 0), (0, 0))
     if profile == "G":      # (12,15)
         return (12, 15, (0, 0), (0, 0)) if cfr_first else (15, 12, (0, 0), (0, 0))
-    if profile == "H":      # (15,16) A-to-move, B holds R=3 hidden
-        if cfr_first:       # CFR=A(15) opens, PL=B(16) holds 3 hidden
-            return (15, 16, (0, 0), (1, 2))
-        # mirror (16,15) B-to-move: PL opens with 15, CFR=16 holds 3 hidden
-        return (16, 15, (1, 2), (0, 0))
+    if profile == "I":      # (13,15) turn-1 even (calibrated at start-turn 1)
+        return (13, 15, (0, 0), (0, 0)) if cfr_first else (15, 13, (0, 0), (0, 0))
     raise ValueError(profile)
 
 
@@ -179,11 +176,15 @@ def main():
     prof = PROFILES[a.profile]
     if "even" in prof:
         pos = {  # noqa: E702
-            "E": "(13,16) R0 V=-0.041", "F": "(11,14) R0 V=-0.038",
-            "G": "(12,15) R0 V=-0.038", "H": "(15,16) R3 V=-0.019",
+            "E": "(13,16) R0 V=-0.041 @t7", "F": "(11,14) R0 V=-0.038 @t7",
+            "G": "(12,15) R0 V=-0.038 @t7",
+            "I": "(13,15) R0 V=-0.068 @t1",
         }[prof["even"]]
         print("[profile %s] even %s, 13-hit style side opens" % (a.profile, pos),
               flush=True)
+        if prof["even"] == "I" and a.start_turn != 1:
+            print("[warn] profile I is calibrated at start-turn 1; use --start-turn 1",
+                  flush=True)
     else:
         hits = profile_hits(prof)
         print("[profile %s] HP=%d ATK=%d  hits: CFR->PL %d, PL->CFR %d"
