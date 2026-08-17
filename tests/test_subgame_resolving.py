@@ -66,7 +66,7 @@ class TurtlingPunishmentTests(unittest.TestCase):
                                       "switch": False})()
                 state = apply(state, move)
                 bot.observe(move.attacks, move.bonuses, move.switch,
-                            budget=before.opponent.actions)
+                            budget=before.opponent.actions, turn=before.turn)
         return state, moves
 
     def test_turtling_1hp_punishment(self):

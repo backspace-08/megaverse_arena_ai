@@ -121,7 +121,7 @@ def main():
             move = Allocation(a, d, b, sw)
             state = apply(state, move)
             bot_obj.observe(move.attacks, move.bonuses, move.switch,
-                            budget=before.player.actions)
+                            budget=before.player.actions, turn=before.turn)
         else:
             # Populate the bot's belief/root strategy for THIS position, but
             # advance the game with the RECORDED move (the bot sampled from the

@@ -82,16 +82,16 @@ class CFRBot:
         self.compress = compress
         self.model = OpponentModel()
         self._reach = None
-        self._observed_turns = 0
         self.last_report = {}
 
     # ------------------------------------------------------------ observations
-    def observe(self, attacks, bonuses=None, switched=False, budget=None,
-                turn=None):
-        """Record a public opponent allocation (mirrors Planner.observe)."""
-        if turn is None:
-            turn = self._observed_turns * 2 + 1
-        self._observed_turns += 1
+    def observe(self, attacks, bonuses=None, switched=False, budget=None, *,
+                turn):
+        """Record a public opponent allocation (mirrors Planner.observe).
+
+        ``turn`` is the half-turn on which the observed allocation happened; it
+        is required so ``base_budget(turn)`` computes the correct revealed bank.
+        """
         if budget is None:
             budget = attacks + int(switched)
         self.model.observe_turn(turn, budget, attacks, switched)

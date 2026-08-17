@@ -62,7 +62,7 @@ def run(seed, a_types, b_types, label, max_half=36):
             state = apply(state, move)
             cfr.observe_shields(before.opponent.shields)
             pl.observe(move.attacks, move.bonuses, move.switch,
-                       budget=before.player.actions)
+                       budget=before.player.actions, turn=before.turn)
         else:
             before = state
             planning = GameState(state.opponent, state.player, state.turn, True)
@@ -78,7 +78,7 @@ def run(seed, a_types, b_types, label, max_half=36):
             state = apply(state, move)
             pl.observe_shields(before.player.shields)
             cfr.observe(move.attacks, move.bonuses, move.switch,
-                        budget=before.opponent.actions)
+                        budget=before.opponent.actions, turn=before.turn)
     winner = "CFR(A)" if state.opponent.lost else "PL(B)" if state.player.lost else "DRAW"
     print("  [end] winner=%s  A-switches=%d B-switches=%d" % (winner, sw_a, sw_b),
           flush=True)
