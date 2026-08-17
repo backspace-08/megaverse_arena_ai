@@ -876,26 +876,27 @@ impl MicroSolver {
             }
         };
         let pA = pA.clamp(0.0, 1.0);
-        // residual HP of the duel winner (damage-exchange model, rho): the
-        // winner loses about rho * (loser's HP) from taking hits in return.
-        let residual_loss = |loser_hp: i32| -> i32 {
-            (self.chain_rho * loser_hp as f64) as i32
+        // Residual HP of the duel winner (damage-exchange model, rho). Discrete
+        // integer arithmetic, no float drift: the winner takes
+        // `round(rho * loser_hp)` damage (>=1), survivor HP = winner - that.
+        let damage_taken = |loser_hp: i32| -> i32 {
+            ((self.chain_rho * loser_hp as f64).round() as i32).max(1)
         };
         let val = if pA <= 0.0 {
             // A's active loses the duel; A's next bench promotes, B survives
-            let hb_new = (hpb - residual_loss(hpa)).max(1);
+            let hb_new = (hpb.saturating_sub(damage_taken(hpa))).max(1);
             let mut rb2 = rb.to_vec();
             rb2[0] = (tb, hb_new);
             self.chain_rec(&ra[1..], &rb2, 0, ba, bb, 0, 0, depth + 1)
         } else if pA >= 1.0 {
             // A's active wins; B's active is dead, B's bench promotes
-            let ha_new = (hpa - residual_loss(hpb)).max(1);
+            let ha_new = (hpa.saturating_sub(damage_taken(hpb))).max(1);
             let mut ra2 = ra.to_vec();
             ra2[0] = (ta, ha_new);
             self.chain_rec(&ra2, &rb[1..], 1, ba, bb, 0, 0, depth + 1)
         } else {
-            let ha_new = (hpa - residual_loss(hpb)).max(1);
-            let hb_new = (hpb - residual_loss(hpa)).max(1);
+            let ha_new = (hpa.saturating_sub(damage_taken(hpb))).max(1);
+            let hb_new = (hpb.saturating_sub(damage_taken(hpa))).max(1);
             let mut ra2 = ra.to_vec();
             ra2[0] = (ta, ha_new);
             let mut rb2 = rb.to_vec();
