@@ -78,7 +78,6 @@ class OpponentModel:
     # reset and a 0-damage attack forces belief to (R, 0).
     _shield_pin: tuple[int, int] | None = None   # (remainder, shields) exact
     _shield_lb: tuple[int, int] | None = None    # (remainder, min_shields)
-    _bank_pin: tuple[int, int] | None = None     # (remainder, bank)
 
     # ---------------------------------------------------------------- observe
 
@@ -105,7 +104,9 @@ class OpponentModel:
         # allocation, never a mapping `remainder -> shields` for future turns.
         self._shield_pin = None
         self._shield_lb = None
-        # The team bank persists across turns and switches: `_bank_pin` stays.
+        # The bank is fully spent each turn and re-placed; the previous split's
+        # reveal is confirmed in `_confirm_previous_bank` and does NOT constrain
+        # the fresh split (no persistent bank pin).
         self._candidates = self._prior(remainder)
 
     def observe_our_attack(self, attacks: int, blocked: int):
@@ -191,9 +192,10 @@ class OpponentModel:
 
         Every legal split carries weight 1/(R+1) - strictly identical to the
         table builder's ``build_belief_roots``. THEN any split inconsistent
-        with a revealed shield pin / lower bound or a revealed bank is hard-
-        zeroed (likelihood = 0) and the rest renormalized - e.g. an a4 that
-        deals 0 damage against R=4 forces belief to (4, 0) exactly.
+        with a revealed shield pin / lower bound is hard-zeroed (likelihood =
+        0) and the rest renormalized - e.g. an a4 that deals 0 damage against
+        R=4 forces belief to (4, 0) exactly. Bank is never carried across
+        turns: a revealed bank only confirms the PREVIOUS split.
         """
         splits = legal_splits(remainder)
         if len(splits) == 1:
@@ -204,8 +206,6 @@ class OpponentModel:
             cand = {k: v for k, v in cand.items() if k[0] == self._shield_pin[1]}
         elif self._shield_lb is not None and self._shield_lb[0] == remainder:
             cand = {k: v for k, v in cand.items() if k[0] >= self._shield_lb[1]}
-        if self._bank_pin is not None and self._bank_pin[0] == remainder:
-            cand = {k: v for k, v in cand.items() if k[1] == self._bank_pin[1]}
         if not cand:
             return {s: w for s in splits}
         tot = sum(cand.values())
@@ -219,15 +219,19 @@ class OpponentModel:
             self._candidates = surviving
 
     def _confirm_previous_bank(self, revealed_bank: int):
-        """A revealed budget proves the bank, hence the earlier split."""
+        """A revealed budget proves the bank, hence the earlier split.
+
+        This only resolves the PREVIOUS split (records[-1]): the live
+        candidates describe that split, so restricting bank == revealed_bank
+        fixes it. It is deliberately NOT carried forward to future splits --
+        the bank is spent and re-placed every turn, so a past reveal tells us
+        nothing about the opponent's current placement.
+        """
         if not self.records:
             return
-        prev_rem = self.records[-1].remainder
         self._restrict(lambda shields, bank: bank == revealed_bank)
         consistent = [key for key in self._candidates if key[1] == revealed_bank]
         if len(consistent) == 1:
             shields = consistent[0][0]
             self.records[-1] = TurnRecord(
                 **{**self.records[-1].__dict__, "confirmed_shields": shields})
-        if consistent:
-            self._bank_pin = (prev_rem, revealed_bank)

@@ -109,14 +109,14 @@ class ShieldPinLifetimeTests(unittest.TestCase):
         self.assertEqual(m._shield_pin, (4, 4))
 
         # a new allocation discards the SHIELD pin (shields are turn-local).
-        # Here the opponent again leaves remainder 4 with a revealed bank of 0,
-        # so the persistent team-bank filter still narrows to (4,0) - that is
-        # legitimate bank evidence, NOT the stale shield observation.
+        # The new reveal (bank 0) resolves the PREVIOUS split (shields 4, bank
+        # 0), but the fresh split (R=4) is a new independent allocation, so it
+        # is unbiased again - the bank is spent and re-placed every turn.
         m.observe_turn(8, 4, 0)
         self.assertIsNone(m._shield_pin)     # shield pin wiped
         self.assertIsNone(m._shield_lb)      # shield lb wiped
-        self.assertIsNotNone(m._bank_pin)    # team bank survives
-        self.assertEqual(m.shield_distribution().get(4, 0.0), 1.0)  # bank filter
+        self.assertEqual(m.records[0].confirmed_shields, 4)  # prev split resolved
+        self.assertEqual(m.shield_distribution().get(4, 0.0), 0.2)  # fresh = uniform
 
         # a switch also discards the shield pin (old fighter's shields vanish).
         # Switch budget is E-1: reveal bank 0 on a remainder of 4.
@@ -128,17 +128,22 @@ class ShieldPinLifetimeTests(unittest.TestCase):
         self.assertIsNone(m2._shield_pin)
         self.assertIsNone(m2._shield_lb)
 
-    def test_bank_pin_survives_new_turn(self):
+    def test_bank_reveal_resolves_previous_split_only(self):
         # reveal bank on turn 8: previous remainder 4, opponent held bank 1.
-        # The pin tracks the MOST RECENT remainder (shield pins are wiped, but
-        # the team bank persists and is re-tagged on every reveal).
+        # The reveal resolves the PREVIOUS split exactly (bank 1 -> shields 3),
+        # but the bank is spent and re-placed every turn, so it must NOT
+        # constrain the fresh split (R=5 here).
         m = OpponentModel()
         m.observe_turn(7, 4, 0)            # remainder 4 (candidates (4,0)..(0,4))
         m.observe_turn(8, 5, 0)            # budget 5 = base 4 + bank 1 (revealed)
-        self.assertEqual(m._bank_pin, (4, 1))  # pinned to prev remainder 4
-        # the shield pin is gone but the bank pin is NOT wiped on a new turn
-        self.assertIsNotNone(m._bank_pin)
-        self.assertIsNone(m._shield_pin)
+        # the earlier split is now resolved: shields 3, bank 1 (sum = R=4)
+        self.assertEqual(m.records[0].confirmed_shields, 3)
+        # the fresh split (R=5) stays unbiased over its partitions (bank capped
+        # at 4 -> banks 0..4 -> 5 splits)
+        worlds = m.worlds()
+        self.assertEqual(len(worlds), 5)
+        self.assertTrue(all(w.shields + w.bank == 5 for w in worlds))
+        self.assertTrue(all(abs(w.probability - 1.0 / 5) < 1e-9 for w in worlds))
 
 
 if __name__ == "__main__":

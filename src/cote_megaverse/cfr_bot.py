@@ -159,8 +159,7 @@ class CFRBot:
         """Root belief from the incoming reach vector, hard-filtered by the
         same observation-consistency facts as the infoset prior, else uniform
         fallback."""
-        pin, lb, bank = (self.model._shield_pin, self.model._shield_lb,
-                         self.model._bank_pin)
+        pin, lb = self.model._shield_pin, self.model._shield_lb
         if self._reach:
             kept = {k: v for k, v in self._reach.items()
                     if k[0] + k[1] == r_opp}
@@ -169,8 +168,6 @@ class CFRBot:
                     kept = {k: v for k, v in kept.items() if k[0] == pin[1]}
                 elif lb is not None and lb[0] == r_opp:
                     kept = {k: v for k, v in kept.items() if k[0] >= lb[1]}
-                if bank is not None and bank[0] == r_opp:
-                    kept = {k: v for k, v in kept.items() if k[1] == bank[1]}
                 total = sum(kept.values())
                 if total > 0.0:
                     return [(_encode_state(state, bk, sh), v / total)
