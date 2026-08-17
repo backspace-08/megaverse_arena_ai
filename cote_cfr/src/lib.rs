@@ -537,6 +537,13 @@ struct MicroSolver {
     // the (expensive) duel-chain DP runs ONCE per unique leaf instead of once
     // per iteration. 3v3 leaf_value reads this if present.
     chain_leaf_vals: Vec<Option<f32>>,
+    // Zero-alloc signature storage: a single flat buffer holding all current
+    // regret-matching strategies, and the start offset of each info set within
+    // it. Filled in-place each iteration via disjoint field borrows - no per-
+    // iteration heap allocation.
+    sig_buf: Vec<f64>,
+    info_offsets: Vec<usize>,
+    sig_len: usize,
 }
 
 /// Per-resolution diagnostic counters (exposed to Python for profiling).
@@ -587,6 +594,9 @@ impl MicroSolver {
             chain_cache: RefCell::new(HashMap::new()),
             chain_rho: 0.7,
             chain_leaf_vals: Vec::new(),
+            sig_buf: Vec::new(),
+            info_offsets: Vec::new(),
+            sig_len: 0,
         };
         s.build();
         s
@@ -700,6 +710,16 @@ impl MicroSolver {
             self.infos[iid].regret = vec![0.0; na];
             self.infos[iid].avg = vec![0.0; na];
         }
+        // flat signature buffer + per-info offsets (allocated once)
+        let mut offs = Vec::with_capacity(self.infos.len());
+        let mut total = 0usize;
+        for info in &self.infos {
+            offs.push(total);
+            total += info.n_acts;
+        }
+        self.info_offsets = offs;
+        self.sig_buf = vec![0.0; total];
+        self.sig_len = total;
         self.r_a = vec![0.0; n];
         self.r_b = vec![0.0; n];
         self.v = vec![0.0; n];
@@ -956,7 +976,34 @@ impl MicroSolver {
 
     fn iterate(&mut self) {
         let n = self.states.len();
-        let sigs = self.sigs();
+        // Zero-alloc strategy computation via disjoint field borrows: infos
+        // (immutable) and sig_buf (mutable) are different fields of self, so
+        // Rust allows this in one call without capturing &mut self.
+        {
+            let infos = &self.infos;
+            let offs = &self.info_offsets;
+            let buf = &mut self.sig_buf;
+            for (iid, info) in infos.iter().enumerate() {
+                let start = offs[iid];
+                let mut sum = 0.0;
+                for (a, &r) in info.regret.iter().enumerate() {
+                    let pos = r.max(0.0);
+                    buf[start + a] = pos;
+                    sum += pos;
+                }
+                let inv = if sum > 0.0 { 1.0 / sum } else { 1.0 / info.n_acts as f64 };
+                for a in 0..info.n_acts {
+                    // BUGFIX: on the all-zero-regret path buf[start+a] holds pos=0
+                    // (from the first loop), so *= inv would stay 0. Recompute the
+                    // normalized value explicitly: pos/sum, or 1/n_acts when uniform.
+                    buf[start + a] = if sum > 0.0 {
+                        buf[start + a] * inv
+                    } else {
+                        inv
+                    };
+                }
+            }
+        }
         self.iter_count += 1;
         let do_prune = self.prune_after > 0 && self.iter_count > self.prune_after;
         if do_prune {
@@ -992,7 +1039,7 @@ impl MicroSolver {
                 continue;
             }
             let iid = self.info_id[i];
-            let sig = &sigs[iid];
+            let base = self.info_offsets[iid];
             let m = if do_prune { Some(&self.mask[iid]) } else { None };
             for (a, &ci) in self.children[i].iter().enumerate() {
                 if let Some(mm) = m {
@@ -1000,7 +1047,7 @@ impl MicroSolver {
                         continue;
                     }
                 }
-                let p = sig[a];
+                let p = self.sig_buf[base + a];
                 if self.states[i].to_move == 0 {
                     self.r_a[ci] += self.r_a[i] * p;
                     self.r_b[ci] += self.r_b[i];
@@ -1024,7 +1071,7 @@ impl MicroSolver {
                 self.v[i] = v;
             } else {
                 let iid = self.info_id[i];
-                let sig = &sigs[iid];
+                let base = self.info_offsets[iid];
                 let m = if do_prune { Some(&self.mask[iid]) } else { None };
                 let mut acc = 0.0;
                 for (a, &ci) in self.children[i].iter().enumerate() {
@@ -1033,7 +1080,7 @@ impl MicroSolver {
                             continue;
                         }
                     }
-                    acc += sig[a] * self.v[ci];
+                    acc += self.sig_buf[base + a] * self.v[ci];
                 }
                 self.v[i] = self.gamma * acc;
             }
@@ -1069,10 +1116,11 @@ impl MicroSolver {
         for iid in 0..self.infos.len() {
             let na = self.infos[iid].n_acts;
             let rsum = self.reach_opp_sum[iid];
+            let base = self.info_offsets[iid];
             let mut v_info = 0.0;
             for a in 0..na {
                 let cfv = if rsum > 0.0 { self.cfv_contrib[iid][a] / rsum } else { 0.0 };
-                v_info += sigs[iid][a] * cfv;
+                v_info += self.sig_buf[base + a] * cfv;
             }
             // sign: A maximizes (+), B minimizes (-)
             let a_move = self.a_move_of_info(iid);
@@ -1082,7 +1130,7 @@ impl MicroSolver {
                 let delta = rsum * sign * (cfv - v_info);
                 let r = self.infos[iid].regret[a] + delta;
                 self.infos[iid].regret[a] = r.max(0.0);
-                self.infos[iid].avg[a] += self.reach_self_sum[iid] * sigs[iid][a];
+                self.infos[iid].avg[a] += self.reach_self_sum[iid] * self.sig_buf[base + a];
             }
         }
         if let Some(st) = self.stats.as_mut() {
