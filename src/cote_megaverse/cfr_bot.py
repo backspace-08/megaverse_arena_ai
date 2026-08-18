@@ -11,6 +11,12 @@ heuristic elsewhere (2v2/3v3). Depth/cap are configurable.
 """
 import os
 import sys
+from collections import Counter
+
+# DIAGNOSTIC (measurement): how often the CSR root belief uses the opponent
+# reach vs falls back to the uniform infoset prior. Module-level so it
+# aggregates across all bot instances in one process.
+_BELIEF_DIAG = Counter()
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 _REPO = os.path.abspath(os.path.join(BASE, "..", ".."))
@@ -157,9 +163,12 @@ class CFRBot:
 
     def _belief_roots(self, state, r_opp, worlds):
         """Root belief from the incoming reach vector, hard-filtered by the
-        same observation-consistency facts as the infoset prior, else uniform
-        fallback."""
+        same observation-consistency facts as the infoset prior, then blended
+        with the soft observation memory so the opponent's observed tendency
+        (e.g. a turtler's repeated 4 shields) reaches the solve root. Falls
+        back to the infoset prior (soft memory) when no reach is available."""
         pin, lb = self.model._shield_pin, self.model._shield_lb
+        mem = self.model.memory_prior(r_opp)
         if self._reach:
             kept = {k: v for k, v in self._reach.items()
                     if k[0] + k[1] == r_opp}
@@ -170,8 +179,25 @@ class CFRBot:
                     kept = {k: v for k, v in kept.items() if k[0] >= lb[1]}
                 total = sum(kept.values())
                 if total > 0.0:
-                    return [(_encode_state(state, bk, sh), v / total)
-                            for (sh, bk), v in kept.items()]
+                    # blend: reach (strategy estimate) x memory (observed
+                    # tendency), normalized - multiplicative so whichever is
+                    # more informative dominates, and nothing is hard-zeroed
+                    # (memory is Laplace-smoothed, so every legal split > 0).
+                    combined = {k: (v / total) * mem.get(k, 0.0)
+                                for k, v in kept.items()}
+                    ctotal = sum(combined.values())
+                    if ctotal > 0.0:
+                        _BELIEF_DIAG["reach_used"] += 1
+                        return [(_encode_state(state, bk, sh), v / ctotal)
+                                for (sh, bk), v in combined.items()]
+                    _BELIEF_DIAG["reach_total0"] += 1
+                else:
+                    _BELIEF_DIAG["reach_kept_empty"] += 1
+            else:
+                _BELIEF_DIAG["reach_kept_empty"] += 1
+        else:
+            _BELIEF_DIAG["reach_missing"] += 1
+        _BELIEF_DIAG["fallback_uniform"] += 1
         return [(_encode_state(state, w.bank, w.shields), w.probability)
                 for w in worlds]
 
